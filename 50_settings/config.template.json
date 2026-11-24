@@ -1,0 +1,35 @@
+{
+  "paths": {
+    "MY_root": "",
+    "MDH_root": ""
+  },
+  "daily": {
+    "template": "50_settings\\templates\\DailyTemplate.md",
+    "update_links": true,
+    "update_schedule": true
+  },
+  "startup": {
+    "open_files": [
+      "{todo}",
+      "{previous_daily}",
+      "{today_daily}"
+    ]
+  },
+  "todo": {
+    "file": "{quicknotes}\\00_TODO.md",
+    "routine_file": "50_settings\\templates\\TodoRoutine.md"
+  },
+  "dotfiles": {
+    "destination": "",
+    "commit_message": "Update dotfiles",
+    "items": []
+  },
+  "db": {
+    "store_dir": "",
+    "python": ""
+  },
+  "concepts": {},
+  "tasks": {
+
+  }
+}

@@ -1,0 +1,2 @@
+*.md text eol=lf
+new_daily_crlf.md -text

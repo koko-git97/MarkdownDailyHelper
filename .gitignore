@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 個人環境の設定
+config.json
+
+# VS Codeの個人設定（必要に応じて調整）
+.vscode/
+
+# Runtime and local release artifacts
+/00_QuickNotes/*
+!/00_QuickNotes/README.md
+/01_Daily/*
+!/01_Daily/README.md
+/10_Aggregate/*
+!/10_Aggregate/README.md
+/50_settings/config.json
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*-journal
+*.log
+*.bak
+*.backup
+*.tmp
+*.replace
+.env
