@@ -148,6 +148,16 @@ README や設定テンプレートに関連記述があっても、以下のコ�
 
 `-Register` は `-Type`・`-OutputPath` と併用不可。Topicが0件の場合は既存の集約・exportを保持する。終了コードは `0` が成功、`1` が一部失敗、`2` が引数・設定エラー、`3` がPython環境エラー、`4` が集約全体の失敗。[操作例](03_daily-workflow.md#concept別の日報を集約する)
 
+### Windowsのjunctionを使った集約
+
+通常の `mdreverse` と `mdrun` では、ローカルディレクトリを指すjunctionを集約ルートまたはその祖先に使えます。集約ルート内部のjunctionは、同じルート内を指す場合も拒否されます。`mdrun` のindexは解決後の集約ルート直下に書き出されます。
+
+`mdreverse -OutputPath` では、明示したexportファイルの祖先にjunctionを使えます。Daily、設定ファイル、設定テンプレートへの出力、および集約領域へのexportは、junctionを経由しても拒否されます。`-Register` の設定保存ではjunctionを含むリパースポイントを拒否します。
+
+シンボリックリンク、ボリュームマウントポイント、その他のリパースポイント、壊れたjunction、循環参照には対応していません。失敗時は、実行直後の `$LASTEXITCODE` とPowerShellのエラーメッセージで対象パスと理由を確認してください。`mdrun` が一部失敗した場合、成功したConceptの出力は更新されることがあります。indexは保持されます。
+
+生成Markdownのリンクは、解決後の出力先を基準に作られます。リンク先が異なるWindowsドライブにある場合は `file:` URIになり、開けるかどうかはMarkdownビューアに依存します。
+
 ## `mdstart`
 
 起動時の日付を固定し、Daily → TODO（Quick Linksを含む）→ DB Status → RebuildまたはSync → ファイル表示 → サマリーの順で実行する。前日以前にチェックした未整理タスクも、当日日報の完了履歴に記録されることがある。
@@ -167,7 +177,7 @@ mdstart -NoOpen -SkipDb -Verbose
 
 Statusが正常でDBが未初期化なら一度だけRebuildする。初期化済みならSyncする。Dailyが失敗した場合はTODOとDBを省略し、TODOの更新・完了記録が失敗した場合はDBを省略する。Statusの失敗・不正応答・破損を検出した場合はDB更新を中止する。Syncの部分成功と表示失敗は警告として集計する。利用可能なファイルの表示とサマリーは、先行する段階で失敗しても続行する。
 
-表示対象は `startup.open_files` に設定する。既定は `{todo}`、`{previous_daily}`、`{today_daily}`。絶対パスとMDHルートからの相対パスも指定できる。VS Code CLIに設定順で `--reuse-window` 付きの要求を送り、サマリーには実行日、各段階の結果、VS Codeへの表示要求件数、全体の完了状態を示す。[取扱説明書](03_daily-workflow.md#朝の作業を始める)
+表示対象は `startup.open_files` の配列に設定する。既定は `{todo}`、`{previous_daily}`、`{today_daily}`。絶対パス、MDHルート基準の相対パス、`{quicknotes}\Projects\MDH.md` のように先頭にフォルダー参照を1個置いたパスを指定できる。不正な指定や存在しない対象は警告してスキップし、前回の日報がない場合は警告なしで省略する。設定の省略、空配列、`null` では表示要求を行わない。VS Code CLIに重複を除いた設定順で `--reuse-window` 付きの要求を送り、サマリーに表示要求件数を示す。[取扱説明書](03_daily-workflow.md#朝の作業を始める)
 
 ---
 

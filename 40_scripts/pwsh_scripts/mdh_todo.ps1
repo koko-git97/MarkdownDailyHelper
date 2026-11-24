@@ -32,16 +32,7 @@ function Get-MdhTodoPath {
         $pathValues.daily = [string]$script:MDH_CONFIG.paths.daily
     }
 
-    $resolved = [regex]::Replace($todoFile, '\{([^{}]+)\}', {
-            param($match)
-
-            $key = $match.Groups[1].Value
-            if (-not $pathValues.ContainsKey($key)) {
-                throw "todo.file に未定義のパス参照があります: {$key}"
-            }
-
-            return $pathValues[$key]
-        })
+    $resolved = Expand-MdhPathPlaceholders -Value $todoFile -PathValues $pathValues -Setting 'todo.file'
 
     if (-not [System.IO.Path]::IsPathRooted($resolved)) {
         $resolved = Join-Path $mdhRoot $resolved

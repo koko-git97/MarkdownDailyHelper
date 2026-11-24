@@ -101,6 +101,14 @@ function Open-MdhStartupFiles {
         return '0 items, 1 warning'
     }
 
+    $pathValues = @{ MDH_root = $script:MDHRoot }
+    foreach ($name in 'quicknotes', 'daily', 'aggregate') {
+        $directory = $script:MDH_CONFIG.paths.$name
+        if (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $pathValues[$name] = $directory
+        }
+    }
+
     foreach ($entry in $entries) {
         try {
             if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) {
@@ -108,22 +116,25 @@ function Open-MdhStartupFiles {
             }
             $path = switch ($entry) {
                 '{todo}' { Get-MdhTodoPath }
-                '{quicknotes}' { $script:MDH_CONFIG.paths.quicknotes }
                 '{today_daily}' { Get-MdhDailyPath -DateText $DateText }
                 '{previous_daily}' {
                     $previous = Get-MdhLastDailyDate -BeforeDate $DateText
                     if ($previous) { Get-MdhDailyPath -DateText $previous }
                 }
                 default {
-                    if ($entry -match '[{}]') { throw '未定義のプレースホルダーです。' }
-                    Get-MdhDbAbsolutePath -Root $script:MDHRoot -Value $entry
+                    $expanded = Expand-MdhPathPlaceholders -Value $entry -PathValues $pathValues -Setting 'startup.open_files' -RejectIncomplete
+                    if ($entry.Contains('{') -and $entry -notmatch '^\{[^{}]+\}(?:[\\/](?![\\/]|[a-z]:)[^{}]*)?$') {
+                        throw 'ディレクトリ参照はパスの先頭に1個だけ指定し、後ろには相対パスを指定してください。'
+                    }
+                    Get-MdhDbAbsolutePath -Root $script:MDHRoot -Value $expanded
                 }
             }
             if (-not $path -and $entry -eq '{previous_daily}') { continue }
             if (-not $path -or -not (Test-Path -LiteralPath $path)) { throw '表示対象が見つかりません。' }
 
             $item = Get-Item -LiteralPath $path -Force
-            if (($entry -eq '{quicknotes}' -and -not $item.PSIsContainer) -or
+            $directoryReference = $entry -match '^\{([^{}]+)\}$' -and $pathValues.ContainsKey($Matches[1])
+            if (($directoryReference -and -not $item.PSIsContainer) -or
                 ($entry -in '{todo}', '{today_daily}', '{previous_daily}' -and $item.PSIsContainer)) {
                 throw '表示対象のファイル種別が設定と一致しません。'
             }

@@ -40,18 +40,45 @@ def _check_environment():
     import mdurl
 
 
-def _target(path, args, safe_path, *, export=False):
+def _target(path, args, root, *, export=False):
     from .aggregate import AggregateError
+    from .aggregate_output import OutputDirectory, _check_spelling, _resolve, safe_path
 
-    target = safe_path(path)
-    daily = args.daily_root.resolve()
-    aggregate = args.aggregate_root.resolve()
-    config = args.config.resolve()
-    if (target.is_relative_to(daily) or target in (config, config.with_name("config.template.json"))
-            or (export and target.is_relative_to(aggregate))
-            or (not export and not target.is_relative_to(aggregate))):
-        raise AggregateError(f"Protected output path: {path}")
-    return target
+    _check_spelling(path)
+    if not export:
+        if isinstance(root, Exception):
+            raise root
+        if not path.is_relative_to(root.logical):
+            raise AggregateError(f"Protected output path: {path}; use {root.logical}")
+        root.check()
+    directory = OutputDirectory(path.parent, path.parent if export else root.logical)
+    candidate = directory.physical / path.name
+    target = safe_path(candidate)
+
+    def check_protection():
+        daily = args.daily_root
+        config = args.config
+        template = config.with_name("config.template.json")
+        for output, daily_root, settings, aggregate in (
+            (path, daily, (config, template), args.aggregate_root),
+            (target, _resolve(daily), (_resolve(config), _resolve(template)),
+             _resolve(args.aggregate_root) if export else root.physical),
+        ):
+            if (output.is_relative_to(daily_root) or output in settings
+                    or output.is_relative_to(aggregate) == export):
+                raise AggregateError(f"Protected output path: {path} -> {target}; "
+                                     f"aggregate root: {aggregate}; choose an unprotected destination")
+
+    def validate():
+        if not export:
+            root.check(bind=True)
+        directory.check()
+        if safe_path(candidate) != target:
+            raise AggregateError(f"Output path changed: {path} -> {target}")
+        check_protection()
+
+    validate()
+    return target, validate
 
 
 def _index(items, directory):
@@ -81,7 +108,7 @@ def _execute(args, report, issues):
     from .aggregate import (AggregateError, Concept, collect_entries, conflicts, decode_config, insert_concept,
                             output_parts, read_concepts, select_entries)
     from .aggregate_markdown import render_topics
-    from .aggregate_output import generated_bytes, publish, safe_path
+    from .aggregate_output import OutputDirectory, generated_bytes, publish
 
     reverse = args.operation == "reverse"
     if reverse and (not args.concept.strip() or (args.type is not None and not args.type.strip())
@@ -106,9 +133,15 @@ def _execute(args, report, issues):
     else:
         concepts = list(registered.values())
 
-    entries = collect_entries(args.daily_root) if concepts else []
     export = reverse and args.output is not None
     preview = reverse and args.type is not None and not export
+    root = None
+    if not (preview or export):
+        try:
+            root = OutputDirectory(args.aggregate_root, args.aggregate_root)
+        except (OSError, ValueError) as error:
+            root = error
+    entries = collect_entries(args.daily_root) if concepts else []
     candidates = list(registered.values()) if reverse and not (preview or export) else list(concepts)
     if reverse and not (preview or export) and requested.name not in registered:
         candidates.append(requested)
@@ -133,7 +166,7 @@ def _execute(args, report, issues):
             target = None
             if not preview:
                 path = args.output if export else args.aggregate_root.joinpath(*parts[concept.name])
-                target = _target(path, args, safe_path, export=export)
+                target, validate = _target(path, args, root, export=export)
             changed = False
             if selected:
                 directory = target.parent if target else args.cwd
@@ -142,7 +175,8 @@ def _execute(args, report, issues):
                     report["markdown"] = body
                 else:
                     kind = "export" if export else "aggregate"
-                    changed = publish(target, generated_bytes(body, kind, concept.name, type_filter))
+                    changed = publish(target, generated_bytes(body, kind, concept.name, type_filter),
+                                      validate=validate)
             successful.append((concept, selected, target))
             report["concepts"].append({"name": concept.name, "topics": len(selected),
                                        "path": str(target) if target and selected else None, "changed": changed})
@@ -150,8 +184,9 @@ def _execute(args, report, issues):
             issues.append({"code": "CONCEPT_FAILED", "message": f"{concept.name}: {error}"})
     if not reverse and not issues:
         try:
-            index = _target(args.aggregate_root / "index.md", args, safe_path)
-            report["index_changed"] = publish(index, generated_bytes(_index(successful, index.parent), "index"))
+            index, validate = _target(args.aggregate_root / "index.md", args, root)
+            report["index_changed"] = publish(index, generated_bytes(_index(successful, index.parent), "index"),
+                                              validate=validate)
         except (OSError, ValueError) as error:
             issues.append({"code": "INDEX_FAILED", "message": str(error)})
     return (1 if successful else 4) if issues else 0

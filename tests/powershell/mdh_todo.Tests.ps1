@@ -58,6 +58,19 @@ Describe 'MDH todo functions' {
         Mock Open-IfExist {}
     }
 
+    It 'keeps TODO path references, default, root fallback and literal braces compatible' {
+        $script:MDH_CONFIG.todo.file = ''
+        (Get-MdhTodoPath) | Should Be (Join-Path $script:MDH_CONFIG.paths.quicknotes '00_TODO.md')
+        $script:MDH_CONFIG.todo.file = '{DAILY}\tasks.md'
+        (Get-MdhTodoPath) | Should Be (Join-Path $script:MDH_CONFIG.paths.daily 'tasks.md')
+        $script:MDHRoot = $null
+        $script:MDH_CONFIG.todo.file = '{MDH_root}\tasks{.md'
+        (Get-MdhTodoPath) | Should Be (Join-Path $script:MDH_CONFIG.paths.MDH_root 'tasks{.md')
+        $script:MDH_CONFIG.todo.file = '{aggregate}\tasks.md'
+        $message = try { Get-MdhTodoPath } catch { $_.Exception.Message }
+        $message | Should Match 'todo\.file に未定義のパス参照があります: \{aggregate\}'
+    }
+
     It 'initializes todo.md and adds routines from the editable routine file' {
         todo
 

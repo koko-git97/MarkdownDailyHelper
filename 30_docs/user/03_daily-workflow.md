@@ -16,7 +16,9 @@ mdstart
 2. `{previous_daily}` — 当日より前の最新日報。該当する日報がなければ省略
 3. `{today_daily}` — 当日日報
 
-絶対パスやMDHルートからの相対パスも指定できます。`{quicknotes}` はQuick Notesフォルダーを開く指定です。フォルダーを指定すると、再利用されるウィンドウの作業フォルダーが切り替わる場合があります。
+絶対パスとMDHルート基準の相対パスを指定できます。`{MDH_root}`、`{quicknotes}`、`{daily}`、`{aggregate}` はフォルダー参照です。パスの先頭に1個だけ指定し、単独ならフォルダーを、`{quicknotes}\Projects\MDH.md` のように相対パスを続けると指定したファイルやサブフォルダーを開きます。QuickNotesの保存先は `paths.quicknotes` で指定し、その中の構成は自由です。上の3つのファイル参照は単独で使います。
+
+フォルダーを開くと、再利用されるウィンドウの作業フォルダーが切り替わる場合があります。不正な参照や存在しない対象は警告してスキップします。ワイルドカードは展開されません。[JSONでの設定例](02_configuration.md#起動conceptquick-links)
 
 同じパスへの要求は一度だけ送ります。VS Code CLIの `--reuse-window` は最後にアクティブだったウィンドウを再利用します。複数ウィンドウがある場合、実行元と異なるウィンドウが選ばれることがあります。`Open` はCLIへの起動要求件数です。CLIが失敗した場合や対象が見つからない場合は警告を表示します。[VS Code CLI](https://code.visualstudio.com/docs/configure/command-line)
 

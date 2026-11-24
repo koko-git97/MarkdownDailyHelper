@@ -1,3 +1,29 @@
+# 許可されたパス参照を一度だけ展開する。
+function Expand-MdhPathPlaceholders {
+    param(
+        [string]$Value,
+        [hashtable]$PathValues,
+        [string]$Setting,
+        [switch]$RejectIncomplete
+    )
+
+    $pattern = '\{([^{}]+)\}'
+    if ($RejectIncomplete) { $pattern += '|[{}]' }
+
+    return [regex]::Replace($Value, $pattern, {
+        param($match)
+
+        if (-not $match.Groups[1].Success) {
+            throw "$Setting に不完全なパス参照があります。"
+        }
+        $key = $match.Groups[1].Value
+        if (-not $PathValues.ContainsKey($key)) {
+            throw "$Setting に未定義のパス参照があります: {$key}"
+        }
+        return $PathValues[$key]
+    })
+}
+
 # ファイルに行を書き込み、UTF-8（BOM付き）で保存する。
 function Write-Utf8 {
     [CmdletBinding()]
@@ -176,9 +202,32 @@ function Open-IfExist {
             throw 'VS Code の code コマンドが見つかりません。'
         }
         # Wait for the CLI to submit each request before issuing the next one.
-        & $code.Source --reuse-window $Path | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "VS Code の起動要求に失敗しました（終了コード $LASTEXITCODE）。"
+        if ($IsWindows -and [IO.Path]::GetExtension($code.Source) -in '.cmd', '.bat') {
+            # Expand each value once inside cmd so literal percent signs survive.
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+            $start.Arguments = '/d /v:off /s /c ""%MDH_START_CODE%" --reuse-window "%MDH_START_PATH%""'
+            $start.UseShellExecute = $false
+            $start.RedirectStandardOutput = $true
+            $start.Environment['MDH_START_CODE'] = $code.Source
+            # A final backslash must survive the closing quote at the native boundary.
+            $start.Environment['MDH_START_PATH'] = $Path -replace '(\\+)$', '$1$1'
+            $process = [Diagnostics.Process]::Start($start)
+            try {
+                $null = $process.StandardOutput.ReadToEnd()
+                $process.WaitForExit()
+                $exitCode = $process.ExitCode
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+        else {
+            & $code.Source --reuse-window $Path | Out-Null
+            $exitCode = $LASTEXITCODE
+        }
+        if ($exitCode -ne 0) {
+            throw "VS Code の起動要求に失敗しました（終了コード $exitCode）。"
         }
     }
     elseif (Get-Command code -ErrorAction SilentlyContinue) {

@@ -38,7 +38,7 @@ PowerShell セッションで読み込まれている設定は、初期化時に
 
 | 設定 | 設定内容 |
 | --- | --- |
-| `startup.open_files` | `mdstart` が開くファイルの配列。配布時の順序とプレースホルダーは[朝の作業](03_daily-workflow.md#朝の作業を始める)を参照 |
+| `startup.open_files` | `mdstart` が設定順に表示を要求するファイル・フォルダーの配列。配布時の順序と参照の種類は[朝の作業](03_daily-workflow.md#朝の作業を始める)を参照 |
 | `concepts` | Concept名をキーにしたオブジェクト。各項目に照合用の文字列配列 `keywords` と任意の `category` を指定できる。未登録時は空オブジェクト |
 | `tasks` | Quick Linksの既存ページへのリンク設定。項目名が表示名、`rel_dir` の省略時は項目名がディレクトリ名。対応するページが実在する場合に表示 |
 | `dotfiles`、`paths.MY_root` | 配布テンプレートにある将来用・旧項目。現行機能の設定には使われない |
@@ -50,7 +50,14 @@ PowerShell セッションで読み込まれている設定は、初期化時に
 ```json
 {
   "startup": {
-    "open_files": ["{todo}", "{previous_daily}", "{today_daily}"]
+    "open_files": [
+      "{quicknotes}\\Overview.md",
+      "{quicknotes}\\Ideas.md",
+      "{quicknotes}\\Projects\\MDH.md",
+      "{todo}",
+      "{previous_daily}",
+      "{today_daily}"
+    ]
   },
   "concepts": {
     "図書整理": {

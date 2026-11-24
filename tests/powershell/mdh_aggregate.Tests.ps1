@@ -58,6 +58,30 @@ Describe 'mdreverse and mdrun from the production loader' {
         $LASTEXITCODE | Should Be 0
         $index = Join-Path $aggregate 'index.md'
         [IO.File]::ReadAllText($index) | Should Match '\[既存\]\('
+        if ($IsWindows) {
+            $physical = Join-Path $root '物理 集約'
+            $exportDirectory = Join-Path $root '物理 export'
+            $exportAlias = Join-Path $root '論理 export'
+            [IO.Directory]::Move($aggregate, $physical)
+            try {
+                $null = New-Item -ItemType Junction -Path $aggregate -Target $physical
+                $null = New-Item -ItemType Directory -Path $exportDirectory
+                $null = New-Item -ItemType Junction -Path $exportAlias -Target $exportDirectory
+                mdreverse sample
+                $LASTEXITCODE | Should Be 0
+                mdrun
+                $LASTEXITCODE | Should Be 0
+                [IO.File]::ReadAllText((Join-Path $physical 'index.md')) | Should Match '\[sample\]\(sample\.md\)'
+                mdreverse sample -OutputPath (Join-Path $exportAlias '報告 書.md')
+                $LASTEXITCODE | Should Be 0
+                [IO.File]::ReadAllText((Join-Path $exportDirectory '報告 書.md')) | Should Match '"kind":"export"'
+            }
+            finally {
+                if ([IO.Directory]::Exists($exportAlias)) { [IO.Directory]::Delete($exportAlias) }
+                if ([IO.Directory]::Exists($aggregate)) { [IO.Directory]::Delete($aggregate) }
+                [IO.Directory]::Move($physical, $aggregate)
+            }
+        }
         $indexHash = (Get-FileHash -LiteralPath $index).Hash
         [IO.File]::WriteAllText($standard, 'personal text')
         mdrun -ErrorAction SilentlyContinue

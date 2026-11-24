@@ -1,9 +1,10 @@
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
@@ -14,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "40_scripts" / "py_
 
 from mdh_db.aggregate import AggregateError, collect_entries, conflicts, filename_part, relative_url, split_type
 from mdh_db.aggregate_cli import _arguments, _execute
-from mdh_db.aggregate_output import generated_bytes, publish
+from mdh_db.aggregate_markdown import render_topics
+from mdh_db.aggregate_output import _writer, generated_bytes, publish
 
 
 class AggregateTests(unittest.TestCase):
@@ -174,6 +176,29 @@ class AggregateTests(unittest.TestCase):
         self.assertIn(f"[元の日報]({prefix}2026-11-23.md)", topic)
         self.assertIn(f"[資料](<{prefix}資料%20%28第1版%29%20%23100%25.txt?mode=raw#節>)", topic)
         self.assertIn(f"![画像]({prefix}画像%20%28書誌%29%23100%25.png)", topic)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows drive paths")
+    def test_render_uses_file_uris_for_links_across_windows_drives(self):
+        self.daily = self.root / "日報 #100%"
+        self.daily.mkdir()
+        path = self.write_daily("2026-11-23", "## Alpha\n\n[資料](資料%20%23%25.txt?view=raw#section)\n")
+        asset = path.with_name("資料 #%.txt")
+        asset.touch()
+        drive = "Y" if path.drive.upper() == "Z:" else "Z"
+        output = Path(f"{drive}:\\Aggregate")
+        warnings = []
+
+        body = render_topics("Alpha", collect_entries(self.daily), output, warnings)
+
+        self.assertEqual(warnings, [])
+        for prefix, expected in (("[元の日報](", path), ("[資料](", asset)):
+            with self.subTest(prefix=prefix):
+                uri = urlsplit(body.split(prefix, 1)[1].split(")", 1)[0])
+                self.assertEqual((uri.scheme, uri.netloc), ("file", ""))
+                self.assertEqual(Path(unquote(uri.path[1:])), expected)
+                self.assertIn("%20%23", uri.path)
+                self.assertIn("%25", uri.path)
+        self.assertIn("?view=raw#section)", body)
 
     def test_reparsed_query_and_anchor_keep_their_meaning(self):
         path = self.write_daily(
@@ -381,7 +406,12 @@ class AggregateTests(unittest.TestCase):
         self.assertFalse(self.aggregate.exists())
         self.assertEqual((daily.read_bytes(), self.config.read_bytes()), (source, config))
 
-    def test_export_refuses_a_linked_directory(self):
+    def junction(self, alias, actual):
+        subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(actual)],
+                       check=True, capture_output=True)
+        self.addCleanup(lambda: alias.rmdir() if os.path.lexists(alias) else None)
+
+    def test_export_refuses_a_symbolic_link(self):
         self.write_daily("2026-11-23", "## Alpha\nbody\n")
         actual = self.root / "actual"
         actual.mkdir()
@@ -389,12 +419,225 @@ class AggregateTests(unittest.TestCase):
         try:
             alias.symlink_to(actual, target_is_directory=True)
         except OSError as error:
-            if os.name != "nt":
-                self.skipTest(f"Cannot create directory symlink: {error}")
-            # Junctions exercise the Windows reparse-point check without elevation.
-            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(actual)],
-                           check=True, capture_output=True)
+            self.skipTest(f"Cannot create directory symlink: {error}")
         code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={alias / 'file.md'}")
         self.assertEqual(code, 4)
         self.assertIn("Unsafe output path", issues[0]["message"])
         self.assertFalse(list(actual.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_junction_root_ancestor_index_export_and_physical_lock(self):
+        daily = self.write_daily("2026-11-23", "## Alpha\nbody\n")
+        self.set_concepts({"Alpha": {}})
+        actual = self.root / "物理 ルート"
+        actual.mkdir()
+        alias = self.root / "論理 ルート"
+        self.junction(alias, actual)
+        self.aggregate = alias / "集約"
+        destination = actual / "集約" / "Alpha.md"
+        with patch("mdh_db.aggregate_output._writer", wraps=_writer) as writer:
+            self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 0)
+            writer.assert_called_once_with(destination)
+        self.assertIn(relative_url(daily, destination.parent), destination.read_text(encoding="utf-8"))
+        self.aggregate = destination.parent
+        with patch("mdh_db.aggregate_output._writer", wraps=_writer) as writer:
+            code, report, _ = self.command("reverse", "--concept=Alpha")
+            self.assertEqual(code, 0)
+            self.assertFalse(report["concepts"][0]["changed"])
+            writer.assert_called_once_with(destination)
+        self.aggregate = self.root / "集約 別名"
+        self.junction(self.aggregate, destination.parent)
+        self.assertEqual(self.command("run")[0], 0)
+        index = destination.with_name("index.md")
+        before = index.read_bytes()
+        self.assertIn(b"[Alpha](Alpha.md)", before)
+        destination.write_text("manual", encoding="utf-8")
+        self.set_concepts({"Alpha": {}, "Empty": {}})
+        self.assertEqual(self.command("run")[0], 1)
+        self.assertEqual(index.read_bytes(), before)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "manual")
+        self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={alias / '報告 書.md'}")[0], 0)
+        self.assertTrue((actual / "報告 書.md").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_internal_protected_broken_and_circular_junctions(self):
+        daily = self.write_daily("2026-11-23", "## Alpha\nbody\n")
+        self.aggregate.mkdir()
+        inside = self.aggregate / "inside"
+        inside.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.set_concepts({"Alpha": {"category": "alias"}})
+        alias = self.aggregate / "alias"
+        for actual in (inside, outside, self.daily):
+            with self.subTest(actual=actual):
+                self.junction(alias, actual)
+                self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 4)
+                self.assertFalse((actual / "Alpha.md").exists())
+                alias.rmdir()
+        for actual in (inside, self.daily):
+            link = self.root / "protected"
+            self.junction(link, actual)
+            self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={link / 'file.md'}")[0], 4)
+            link.rmdir()
+        self.junction(self.root / "settings", self.config.parent)
+        template = self.config.with_name("config.template.json")
+        template.write_bytes(b"settings template")
+        before = self.config.read_bytes()
+        for protected in (self.config, template):
+            code, _, issues = self.command("reverse", "--concept=Alpha",
+                                           f"--output={self.root / 'settings' / protected.name}")
+            self.assertEqual(code, 4)
+            self.assertIn("Protected output", issues[0]["message"])
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(template.read_bytes(), b"settings template")
+        self.junction(alias, outside)
+        outside.rmdir()
+        self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={alias / 'file.md'}")[0], 4)
+        self.junction(outside, alias)
+        self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={alias / 'file.md'}")[0], 4)
+        self.assertTrue(daily.is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_registration_and_retargeting_preserve_existing_files(self):
+        self.write_daily("2026-11-23", "## Alpha\nbody\n")
+        actual = self.root / "actual"
+        other = self.root / "other"
+        actual.mkdir()
+        other.mkdir()
+        self.junction(self.aggregate, actual)
+        original_config = self.config
+        self.config.rename(actual / "config.json")
+        self.config = self.aggregate / "config.json"
+        before = self.config.read_bytes()
+        with self.assertRaises(AggregateError):
+            self.command("reverse", "--concept=Alpha", "--register")
+        self.assertEqual(self.config.read_bytes(), before)
+        self.config = original_config
+        self.config.write_bytes(before)
+        self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 0)
+        output = actual / "Alpha.md"
+        before = output.read_bytes()
+        self.write_daily("2026-11-23", "## Alpha\nnew body\n")
+        flush = os.fsync
+
+        def retarget(descriptor):
+            flush(descriptor)
+            self.aggregate.rmdir()
+            self.junction(self.aggregate, other)
+
+        with patch("mdh_db.aggregate_output.os.fsync", side_effect=retarget):
+            self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 4)
+        self.assertEqual(output.read_bytes(), before)
+        self.assertFalse(list(actual.glob(".mdh-*.tmp")))
+        self.assertFalse(list(other.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_mdrun_keeps_initial_root_after_first_concept_is_published(self):
+        self.write_daily("2026-11-23", "## Alpha\nfirst\n\n## Beta\nsecond\n")
+        self.set_concepts({"Alpha": {}, "Beta": {}})
+        actual = self.root / "actual"
+        other = self.root / "other"
+        actual.mkdir()
+        other.mkdir()
+        self.junction(self.aggregate, actual)
+        self.assertEqual(self.command("run")[0], 0)
+        index = (actual / "index.md").read_bytes()
+        beta = (actual / "Beta.md").read_bytes()
+        self.write_daily("2026-11-23", "## Alpha\nupdated first\n\n## Beta\nupdated second\n")
+
+        def retarget_after_publish(path, *args, **kwargs):
+            changed = publish(path, *args, **kwargs)
+            self.assertEqual(path, actual / "Alpha.md")
+            self.aggregate.rmdir()
+            self.junction(self.aggregate, other)
+            return changed
+
+        with patch("mdh_db.aggregate_output.publish", side_effect=retarget_after_publish):
+            code, report, issues = self.command("run")
+        self.assertEqual(code, 1)
+        self.assertTrue(report["concepts"][0]["changed"])
+        self.assertEqual(issues[0]["code"], "CONCEPT_FAILED")
+        self.assertEqual((actual / "index.md").read_bytes(), index)
+        self.assertEqual((actual / "Beta.md").read_bytes(), beta)
+        self.assertFalse(list(other.iterdir()))
+
+    def test_publish_never_overwrites_new_destination_and_cleans_temporary(self):
+        path = self.root / "report.md"
+        content = generated_bytes("generated\n", "export", "A")
+        real_publish = os.rename if os.name == "nt" else os.link
+
+        def create_destination(source, destination):
+            path.write_bytes(b"new external file")
+            real_publish(source, destination)
+
+        operation = "rename" if os.name == "nt" else "link"
+        with patch(f"mdh_db.aggregate_output.os.{operation}", side_effect=create_destination):
+            with self.assertRaises(FileExistsError):
+                publish(path, content)
+        self.assertEqual(path.read_bytes(), b"new external file")
+        self.assertFalse(list(self.root.glob(".mdh-*.tmp")))
+
+    def test_publish_rejects_parent_replacement_and_keeps_unrelated_temporary_name(self):
+        directory = self.root / "output"
+        directory.mkdir()
+        moved = self.root / "moved"
+        path = directory / "report.md"
+        content = generated_bytes("generated\n", "export", "A")
+        path.write_bytes(content)
+
+        def replace_parent():
+            directory.rename(moved)
+            directory.mkdir()
+            temporary = next(moved.glob(".mdh-*.tmp"))
+            (directory / temporary.name).write_bytes(b"unrelated")
+
+        @contextmanager
+        def temporary_file(**kwargs):
+            with NamedTemporaryFile(**kwargs) as handle:
+                yield handle
+            replace_parent()
+
+        with patch("mdh_db.aggregate_output.NamedTemporaryFile", side_effect=temporary_file):
+            with self.assertRaisesRegex(AggregateError, "directory changed"):
+                publish(path, generated_bytes("updated\n", "export", "A"))
+        self.assertEqual((moved / path.name).read_bytes(), content)
+        self.assertFalse(path.exists())
+        self.assertEqual(next(directory.glob(".mdh-*.tmp")).read_bytes(), b"unrelated")
+
+    def test_hard_link_and_temporary_write_failure_preserve_original(self):
+        path = self.root / "report.md"
+        content = generated_bytes("generated\n", "export", "A")
+        updated = generated_bytes("updated\n", "export", "A")
+        path.write_bytes(content)
+        alias = self.root / "alias.md"
+        os.link(path, alias)
+        with self.assertRaisesRegex(AggregateError, "single regular file"):
+            publish(path, updated)
+        self.assertEqual(alias.read_bytes(), content)
+        alias.unlink()
+        with patch("mdh_db.aggregate_output.os.fsync", side_effect=OSError("flush failed")):
+            with self.assertRaisesRegex(OSError, "flush failed"):
+                publish(path, updated)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(list(self.root.glob(".mdh-*.tmp")))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows reparse attributes")
+    def test_unknown_reparse_attributes_are_rejected_even_when_lstat_looks_normal(self):
+        from stat import FILE_ATTRIBUTE_REPARSE_POINT
+        from mdh_db.aggregate_output import _windows_attributes
+
+        self.write_daily("2026-11-23", "## Alpha\nbody\n")
+        directory = self.root / "unknown"
+        directory.mkdir()
+        attributes = _windows_attributes()
+
+        def inspect(path):
+            value = attributes(path)
+            return value | FILE_ATTRIBUTE_REPARSE_POINT if path == directory else value
+
+        with patch("mdh_db.aggregate_output._windows_attributes", return_value=inspect):
+            code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={directory / 'file.md'}")
+        self.assertEqual(code, 4)
+        self.assertIn("reparse point", issues[0]["message"])
+        self.assertFalse(list(directory.iterdir()))

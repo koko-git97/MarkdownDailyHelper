@@ -1,6 +1,6 @@
 $startupScripts = Join-Path $PSScriptRoot '../../40_scripts/pwsh_scripts'
 $startupTemplate = Join-Path $PSScriptRoot '../../50_settings/templates/DailyTemplate.md'
-foreach ($scriptName in 'common', 'daily', 'todo', 'quicklinks', 'db', 'start') {
+foreach ($scriptName in 'common', 'init', 'daily', 'todo', 'quicklinks', 'db', 'start') {
     . (Join-Path $startupScripts "mdh_$scriptName.ps1")
 }
 
@@ -273,6 +273,89 @@ Describe 'mdstart' {
         $output | Should Match '警告付き完了'
     }
 
+    It 'opens directory references and nested external notes in order with literal paths' {
+        $quicknotes = Join-Path $TestDrive '外部 Notes O''Brien {literal}'
+        $aggregate = Join-Path $script:MDHRoot 'Aggregate'
+        $script:MDH_CONFIG.paths.quicknotes = $quicknotes
+        $script:MDH_CONFIG.paths | Add-Member -NotePropertyName aggregate -NotePropertyValue $aggregate
+        Ensure-Directory -Path (Join-Path $quicknotes 'Projects')
+        Ensure-Directory -Path $aggregate
+        $overview = Join-Path $quicknotes 'Overview.md'
+        $project = Join-Path $quicknotes 'Projects/開発 [1].md'
+        $index = Join-Path $aggregate 'index.md'
+        foreach ($path in $overview, $project, $index) {
+            [IO.File]::WriteAllText($path, '# Fixture')
+        }
+        $script:MDH_CONFIG.startup.open_files = @(
+            '{QUICKNOTES}\Overview.md', '{quicknotes}/Projects/開発 [1].md',
+            '{quicknotes}\Projects\..\Overview.md', '{MDH_root}', '{daily}', '{aggregate}\index.md', $index, $aggregate
+        )
+
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 6 items'
+        ($script:startupOpened -join '|') |
+            Should Be (@($overview, $project, $script:MDHRoot, $script:MDH_CONFIG.paths.daily, $index, $aggregate) -join '|')
+    }
+
+    It 'warns for invalid entries and continues without globbing or warning for a missing previous Daily' {
+        $note = Join-Path $script:MDH_CONFIG.paths.quicknotes 'Overview.md'
+        [IO.File]::WriteAllText($note, '# Fixture')
+        $script:MDH_CONFIG.startup.open_files = @(
+            '{unknown}\Overview.md', '{quicknotes\Overview.md', '{quicknotes}}', '{quicknotes}\missing.md',
+            '', $null, 123, @('nested.md'), [pscustomobject]@{ file = 'Overview.md' },
+            '{todo}\file.md', '{today_daily}\file.md', '{previous_daily}\file.md',
+            '{quicknotes}\{daily}\file.md', '{MDH_root}{quicknotes}', 'prefix{quicknotes}\file.md',
+            '{quicknotes}\*.md', '{previous_daily}', '{quicknotes}\Overview.md'
+        )
+
+        $result = Open-MdhStartupFiles -DateText $script:startupDate -WarningVariable warnings 3>$null
+        $result | Should Be 'Requested 1 item, 16 warnings'
+        $warnings.Count | Should Be 16
+        @($warnings | Where-Object Message -Match '先頭に1個').Count | Should Be 3
+        ($warnings.Message -join '|') | Should Match '未定義のパス参照'
+        ($warnings.Message -join '|') | Should Match '不完全なパス参照'
+        ($script:startupOpened -join '|') | Should Be $note
+    }
+
+    It 'distinguishes a one-element array from a string read from config.json and honors NoOpen' {
+        $configPath = Join-Path $script:MDHRoot 'config.json'
+        $note = Join-Path $script:MDH_CONFIG.paths.quicknotes 'Overview.md'
+        [IO.File]::WriteAllText($note, '# Fixture')
+        $script:MDH_CONFIG.startup.open_files = @('{quicknotes}\Overview.md')
+        $script:MDH_CONFIG | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
+        $script:MDH_CONFIG = Read-MdhConfiguration -MDHRoot $script:MDHRoot -MDHConfig $configPath
+
+        $output = (mdstart -NoOpen -SkipDb 6>&1) -join "`n"
+        $output | Should Match 'VS Code : 省略（-NoOpen）'
+        $script:startupOpened.Count | Should Be 0
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 1 item'
+        $script:startupOpened[0] | Should Be $note
+
+        $script:MDH_CONFIG.startup.open_files = '{quicknotes}\Overview.md'
+        $script:MDH_CONFIG | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
+        $script:MDH_CONFIG = Read-MdhConfiguration -MDHRoot $script:MDHRoot -MDHConfig $configPath
+        (Open-MdhStartupFiles -DateText $script:startupDate 3>$null) | Should Be '0 items, 1 warning'
+        $script:startupOpened.Count | Should Be 1
+    }
+
+    It 'makes no display requests for empty, null or omitted settings and warns for nonarrays' {
+        $script:MDH_CONFIG.startup.open_files = @()
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 0 items'
+        $script:MDH_CONFIG.startup.open_files = $null
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 0 items'
+        $script:MDH_CONFIG.startup = [pscustomobject]@{}
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 0 items'
+        $script:MDH_CONFIG.PSObject.Properties.Remove('startup')
+        (Open-MdhStartupFiles -DateText $script:startupDate) | Should Be 'Requested 0 items'
+
+        foreach ($invalid in '{quicknotes}', 123, @{ path = '{quicknotes}' }) {
+            $script:MDH_CONFIG | Add-Member -Force -NotePropertyName startup -NotePropertyValue @{ open_files = $invalid }
+            (Open-MdhStartupFiles -DateText $script:startupDate -WarningVariable warnings 3>$null) |
+                Should Be '0 items, 1 warning'
+            $warnings[0].Message | Should Match '配列で指定'
+        }
+        $script:startupOpened.Count | Should Be 0
+    }
+
     Context 'Daily non-terminating errors' {
         It 'stops TODO and DB even when today already exists' {
             $null = Set-TestStartupDaily -DateText $script:startupDate -Content '# Existing Daily'
@@ -306,6 +389,46 @@ Describe 'mdstart' {
 }
 
 Describe 'mdstart file display' {
+    It 'passes a special-character path intact through the Windows CLI wrapper' -Skip:(-not $env:MDH_TEST_PYTHON_EXECUTABLE) {
+        $script:MDHRoot = $TestDrive
+        $cli = Join-Path $TestDrive 'native-cli'
+        $notes = Join-Path $cli '日本語 O''Brien [1] {literal} & (notes)'
+        Ensure-Directory -Path $notes
+        $note = Join-Path $notes '100% %MDH_TEST_CLI_MARKER%.md'
+        [IO.File]::WriteAllText($note, '# Fixture')
+        $log = Join-Path $cli 'argv.json'
+        [IO.File]::WriteAllText((Join-Path $cli 'argv.py'),
+            'import json, os, pathlib, sys; pathlib.Path(os.environ["MDH_TEST_CODE_LOG"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")')
+        [IO.File]::WriteAllLines((Join-Path $cli 'code.cmd'), @(
+            '@echo off'
+            'setlocal'
+            '"%MDH_TEST_PYTHON_EXECUTABLE%" "%~dp0argv.py" %*'
+            'exit /b %ERRORLEVEL%'
+        ))
+        $script:MDH_CONFIG = @{
+            paths = @{ quicknotes = $notes }
+            startup = @{ open_files = @('{quicknotes}\100% %MDH_TEST_CLI_MARKER%.md') }
+        }
+        $originalPath = $env:PATH
+        $originalLog = $env:MDH_TEST_CODE_LOG
+        $originalMarker = $env:MDH_TEST_CLI_MARKER
+        try {
+            $env:PATH = "$cli;$originalPath"
+            $env:MDH_TEST_CODE_LOG = $log
+            $env:MDH_TEST_CLI_MARKER = 'expanded'
+            (Open-MdhStartupFiles -DateText '2026-11-23') | Should Be 'Requested 1 item'
+            $arguments = Get-Content -Raw -LiteralPath $log | ConvertFrom-Json -NoEnumerate
+            $arguments.Count | Should Be 2
+            $arguments[0] | Should Be '--reuse-window'
+            $arguments[1] | Should Be $note
+        }
+        finally {
+            $env:PATH = $originalPath
+            $env:MDH_TEST_CODE_LOG = $originalLog
+            $env:MDH_TEST_CLI_MARKER = $originalMarker
+        }
+    }
+
     It 'submits multiple ordered file requests with reuse-window and resolves the configured TODO' {
         $script:MDHRoot = $TestDrive
         $todoPath = Join-Path $TestDrive 'my tasks.md'
