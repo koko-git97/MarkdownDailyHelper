@@ -33,6 +33,9 @@ def _arguments(argv):
     parser = Arguments(prog="mdh_db", add_help=False)
     commands = parser.add_subparsers(dest="operation", required=True)
     commands.add_parser("environment", add_help=False)
+    quicknotes = commands.add_parser("quicknotes", add_help=False)
+    quicknotes.add_argument("--root", type=_absolute, required=True)
+    quicknotes.add_argument("--query", required=True)
     for operation in ("status", "sync", "rebuild", "search"):
         command = commands.add_parser(operation, add_help=False)
         command.add_argument("--store", type=_absolute, required=True)
@@ -77,6 +80,17 @@ def _diagnostic(code, message, **details):
 
 
 def _execute(args):
+    if args.operation == "quicknotes":
+        from .aggregate import AggregateError
+        from .quicknotes_search import search_quicknotes
+
+        try:
+            return 0, search_quicknotes(args.root, args.query), []
+        except (OSError, AggregateError) as error:
+            return 4, None, [_diagnostic("QUICKNOTES_ROOT", error)]
+        except ValueError as error:
+            return 2, None, [_diagnostic("INVALID_INPUT", error)]
+
     from . import generation
     from .storage import DailyRootMismatch, DatabaseIntegrityError, SchemaVersionError
 
@@ -119,7 +133,7 @@ def _execute(args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    operation = argv[0] if argv and argv[0] in {"status", "sync", "rebuild", "search", "environment"} else None
+    operation = argv[0] if argv and argv[0] in {"status", "sync", "rebuild", "search", "quicknotes", "environment"} else None
     try:
         args = _arguments(argv)
     except ValueError as error:

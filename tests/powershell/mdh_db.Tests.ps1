@@ -103,7 +103,7 @@ Describe 'MDH DB commands' {
                     incomplete = $false; stale_in_scope = 0; undated_invalid = 0
                     excluded = [pscustomobject]@{ STALE = 0 }; last_full_success = '2026-11-23T00:00:00Z'
                     hits = @([pscustomobject]@{
-                        day = '2026-11-19'; title = '図書A'; path = '2026/2026-11/2026-11-19.md'
+                        day = '2026-11-19'; title = '図書A'; path = '2026/2026-11/2026-11-19.md'; kind = 'topic'
                         status = 'CURRENT'; from_last_good_snapshot = $false; snapshot_hash = 'indexed'
                         matches = @(
                             [pscustomobject]@{ line = 10; excerpt = '図書' }
@@ -124,13 +124,14 @@ Describe 'MDH DB commands' {
         $listed = @(mdsearch '図書 整理' 6>&1)
         $messages = ($listed | Where-Object { $_ -is [System.Management.Automation.InformationRecord] }) -join "`n"
         $relative = '人工 日報\2026\2026-11\2026-11-19.md'
-        $messages | Should Match ([regex]::Escape('[2026-11-19] 図書A (索引 L10)'))
-        $messages | Should Match ([regex]::Escape('[2026-11-19] 図書A (索引 L14)'))
+        ([regex]::Matches($messages, '2026-11-19 \| 図書A')).Count | Should Be 1
+        $messages | Should Match '索引 L10 \| 図書 / 評価'
+        $messages | Should Match '索引 L14 \| 整理'
         $messages | Should Match '行番号は索引作成時の位置'
         $messages | Should Match ([regex]::Escape($relative))
         $messages | Should Match '図書'
         $messages | Should Match '整理'
-        $messages | Should Match '2件'
+        $messages | Should Match '1 Topics / 2 matching lines'
         $messages.Contains('最新の原文') | Should Be $false
         $messages.Contains('contract_version') | Should Be $false
         @($listed | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] }).Count | Should Be 0
@@ -154,7 +155,7 @@ Describe 'MDH DB commands' {
         (Format-MdhSearchLine -Line $line -Matches $matches) | Should Be $line
         $highlighted = Format-MdhSearchLine -Line $line -Matches $matches -Highlight
         foreach ($match in $matches) {
-            $highlighted.Contains("$($PSStyle.Foreground.Yellow)$($match.excerpt)$($PSStyle.Reset)") | Should Be $true
+            $highlighted.Contains("$([char]27)[33m$($match.excerpt)$([char]27)[0m") | Should Be $true
         }
         ($highlighted -replace '\x1b\[[0-9;]*m', '') | Should Be $line
     }
@@ -175,6 +176,142 @@ Describe 'MDH DB commands' {
         @($display | Where-Object { $_ -isnot [Management.Automation.InformationRecord] }).Count | Should Be 0
         ($display -join ' ') | Should Match '検索に失敗.*md-db -Status'
         $LASTEXITCODE | Should Be 4
+    }
+
+    It 'merges overlap, highlights repeated ASCII matches, and renders source controls visibly' {
+        $line = "📚 SQLite SQL $([char]27)[2J Ä ä"
+        $matches = @(
+            [pscustomobject]@{ column = 3; excerpt = 'SQLite'; term = 'SQLite' }
+            [pscustomobject]@{ column = 3; excerpt = 'SQL'; term = 'sql' }
+            [pscustomobject]@{ column = 20; excerpt = 'Ä'; term = 'Ä' }
+        )
+        (Format-MdhSearchLine -Line $line -Matches $matches) | Should Be '📚 SQLite SQL \u001B[2J Ä ä'
+        $colored = Format-MdhSearchLine -Line $line -Matches $matches -Highlight
+        $colored | Should Match ([regex]::Escape("$([char]27)[33mSQLite$([char]27)[0m $([char]27)[33mSQL$([char]27)[0m"))
+        $colored | Should Not Match ([regex]::Escape("$([char]27)[2J"))
+        $colored | Should Not Match ([regex]::Escape("$([char]27)[33mä"))
+    }
+
+    It 'validates extended requests before either source and emits Raw before a terminating error' {
+        Mock Invoke-MdhDbCommand { throw 'Daily should not run' } -ParameterFilter {
+            $Operation -eq 'search' -and ($Arguments -contains '--query=term' -or
+                $Arguments -contains "--query=bad$([char]0)query")
+        }
+        Mock Invoke-MdhQuickNotesSearch { throw 'QuickNotes should not run' } -ParameterFilter {
+            $Query -eq 'term' -or $Query -eq "bad$([char]0)query"
+        }
+        foreach ($options in @(
+            @{ Scope = 'All'; From = '2026-02-30' },
+            @{ Scope = 'All'; From = '2026-11-24'; To = '2026-11-23' },
+            @{ Scope = 'QuickNotes'; IncludeStale = $true }
+        )) {
+            $r = mdsearch 'term' @options -Raw -ErrorAction SilentlyContinue
+            $r.exit_code | Should Be 2
+            $r.sources.PSObject.Properties.Name | Should BeNullOrEmpty
+            $LASTEXITCODE | Should Be 2
+        }
+        $seen = [Collections.Generic.List[object]]::new()
+        try {
+            mdsearch "bad$([char]0)query" -Scope All -Raw -ErrorAction Stop | ForEach-Object { $seen.Add($_) }
+            throw 'Expected a terminating error'
+        }
+        catch { $_.FullyQualifiedErrorId | Should Match 'MDH_SEARCH_2' }
+        $seen.Count | Should Be 1
+        $seen[0].status | Should Be 'error'
+        Assert-MockCalled Invoke-MdhDbCommand -Times 0 -Exactly -Scope It
+        Assert-MockCalled Invoke-MdhQuickNotesSearch -Times 0 -Exactly -Scope It
+    }
+
+    It 'searches notes without a DB and isolates success, partial failure and total failure' -Skip:(-not $env:MDH_TEST_PYTHON_EXECUTABLE) {
+        $script:MDHRoot = Join-Path $TestDrive 'isolated cross-source search'
+        $notes = Join-Path $TestDrive "外部 Notes O'Brien"
+        $null = New-Item -ItemType Directory -Force -Path $notes
+        $script:MDH_CONFIG.paths | Add-Member -NotePropertyName quicknotes -NotePropertyValue $notes
+        $note = Join-Path $notes 'Ideas.md'
+        [IO.File]::WriteAllLines($note, @('# Ideas', 'SQL', 'index'))
+        $before = (Get-FileHash -LiteralPath $note).Hash
+        $store = (Get-MdhDbSettings).Store
+        $script:MDH_CONFIG.db.store_dir = '\\invalid\store'
+        $quick = @(mdsearch 'SQL index' -Scope QuickNotes -Raw -DebugInfo 6>$null)
+        $quick.Count | Should Be 1
+        $quick[0].status | Should Be 'success'
+        $quick[0].sources.PSObject.Properties.Name | Should Be 'quicknotes'
+        $quick[0].sources.quicknotes.result.matching_lines | Should Be 2
+        (Get-FileHash -LiteralPath $note).Hash | Should Be $before
+        $script:MDH_CONFIG.db.store_dir = $store
+        (Test-Path -LiteralPath $store) | Should Be $false
+        $partial = mdsearch 'SQL index' -Scope All -Raw -ErrorAction SilentlyContinue
+        $partial.status | Should Be 'partial'
+        $partial.sources.daily.response.diagnostics[0].code | Should Be 'ACTIVE_DATABASE_ERROR'
+        $partial.sources.quicknotes.result.files_matched | Should Be 1
+        $LASTEXITCODE | Should Be 1
+        $display = (mdsearch 'SQL index' -Scope All -ErrorAction SilentlyContinue 6>&1) -join [Environment]::NewLine
+        $display | Should Match '===== DAILY =====[\s\S]*検索失敗[\s\S]*===== QUICKNOTES ====='
+        $display | Should Match ([regex]::Escape($note))
+        $display | Should Match '部分失敗'
+        $display | Should Not Match ([string][char]27)
+
+        $daily = Join-Path (Get-MdhDbSettings).Daily '2026/2026-11/2026-11-22.md'
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $daily)
+        [IO.File]::WriteAllLines($daily, @('# ✅ やったこと', '', '## SQL', 'index'))
+        (md-db -Rebuild -Confirm:$false).exit_code | Should Be 0
+        $db = Get-ChildItem -LiteralPath $store -Filter '*.sqlite' | Select-Object -First 1
+        $dbHash = (Get-FileHash -LiteralPath $db.FullName).Hash
+        $rawDaily = mdsearch 'SQL index' -Raw
+        $explicit = mdsearch 'SQL index' -Scope Daily -Raw
+        ($rawDaily | ConvertTo-Json -Depth 15) | Should Be ($explicit | ConvertTo-Json -Depth 15)
+        $all = mdsearch 'SQL index' -Scope All -From '2026-11-22' -To '2026-11-22' -Raw
+        $all.status | Should Be 'success'
+        $all.sources.daily.filters.from | Should Be '2026-11-22'
+        $all.sources.daily.response.result.hits.Count | Should Be 1
+        $all.sources.quicknotes.result.files_matched | Should Be 1
+        $both = (mdsearch 'SQL index' -Scope All -From '2026-11-22' -FullPath -List 6>&1) -join [Environment]::NewLine
+        $both | Should Match '2 Groups / 4 matching lines'
+        $both | Should Match 'QuickNotesには日付制限を適用しません'
+        [IO.File]::WriteAllText($note, 'note-only')
+        $noCrossSource = mdsearch 'SQL note-only' -Scope All -Raw
+        $noCrossSource.sources.daily.response.result.hits.Count | Should Be 0
+        $noCrossSource.sources.quicknotes.result.files_matched | Should Be 0
+        [IO.File]::WriteAllBytes((Join-Path $notes 'invalid.md'), [byte[]]@(255))
+        $incomplete = mdsearch 'note-only' -Scope QuickNotes -Raw -WarningAction SilentlyContinue
+        $incomplete.status | Should Be 'success'
+        $incomplete.sources.quicknotes.result.incomplete | Should Be $true
+        $incomplete.sources.quicknotes.result.files_matched | Should Be 1
+        $script:MDH_CONFIG.paths.quicknotes = Join-Path $notes 'missing'
+        $partial = mdsearch SQL -Scope All -Raw -ErrorAction SilentlyContinue
+        $partial.status | Should Be 'partial'
+        $partial.sources.daily.response.result.hits.Count | Should Be 1
+        $partial.sources.quicknotes.diagnostics[0].code | Should Be 'QUICKNOTES_ROOT'
+        (Get-FileHash -LiteralPath $db.FullName).Hash | Should Be $dbHash
+        $script:MDH_CONFIG.db.store_dir = Join-Path $TestDrive 'absent database'
+        $bothFailed = mdsearch SQL -Scope All -Raw -ErrorAction SilentlyContinue
+        $bothFailed.status | Should Be 'error'
+        $bothFailed.exit_code | Should Be 4
+        $bothFailed.sources.daily.status | Should Be 'error'
+        $bothFailed.sources.quicknotes.status | Should Be 'error'
+    }
+
+    It 'keeps same-title groups separate and counts only the distinct matching rows in each group' {
+        $relative = '2026/2026-11/2026-11-18.md'
+        Mock Read-MdhTextFile { throw 'injected missing source' } -ParameterFilter { $Path -like '*2026-11-18.md' }
+        $first = [pscustomobject]@{ line = 12; excerpt = ('long-' + ('x' * 400)) }
+        $second = [pscustomobject]@{ line = 2; excerpt = 'heading hit' }
+        $control = [pscustomobject]@{ line = 3; excerpt = "safe$([char]27)[2J" }
+        $result = [pscustomobject]@{ incomplete = $false; hits = @(
+            [pscustomobject]@{ kind='topic'; group_start=20; day='2026-11-18'; title='Same'; path=$relative;
+                status='CURRENT'; snapshot_hash='indexed'; matches=@($first,$second,$second) },
+            [pscustomobject]@{ kind='topic'; group_start=120; day='2026-11-18'; title='Same'; path=$relative;
+                status='CURRENT'; snapshot_hash='indexed'; matches=@($control) },
+            [pscustomobject]@{ kind='preamble'; group_start=0; day='2026-11-18'; title=''; path=$relative;
+                status='CURRENT'; snapshot_hash='indexed'; matches=@($second) }
+        ) }
+        $display = (Write-MdhSearchList -Query search -Result $result 6>&1) -join [Environment]::NewLine
+        ([regex]::Matches($display, '2026-11-18 \| Same')).Count | Should Be 2
+        $display | Should Match '3 Groups \(2 Topics\) / 4 matching lines'
+        $display | Should Match '索引 L2[\s\S]+索引 L12'
+        $display | Should Match ([regex]::Escape($first.excerpt))
+        $display | Should Match '前文'
+        $display | Should Not Match ([string][char]27)
     }
 
     It 'runs all commands through Python and preserves a partial sync result' -Skip:(-not $env:MDH_TEST_PYTHON_EXECUTABLE) {
@@ -212,7 +349,7 @@ Describe 'MDH DB commands' {
 
         $listing = @(mdsearch '図書A　貸出集計' -From '2026-11-22' -To '2026-11-22' -List 6>&1)
         ($listing -join "`n") | Should Match '貸出集計📚'
-        ($listing -join "`n") | Should Match '\(L8\)'
+        ($listing -join "`n") | Should Match 'L8 \|'
         ($listing -join "`n") | Should Not Match '索引 L8'
         $response = mdsearch '図書A　貸出集計' -Raw -From '2026-11-22' -To '2026-11-22'
         $response.result.hits[0].title | Should Be '図書A'

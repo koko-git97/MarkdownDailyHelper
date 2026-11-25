@@ -4,7 +4,7 @@ Describe 'MDH installer' {
     BeforeEach {
         $root = Join-Path $TestDrive ("MDH 日本語 ' " + [guid]::NewGuid())
         $null = [IO.Directory]::CreateDirectory($root)
-        Copy-Item -LiteralPath (Join-Path $repository 'install.ps1') -Destination $root
+        Copy-Item -LiteralPath (Join-Path $repository 'install.ps1'), (Join-Path $repository 'VERSION') -Destination $root
         foreach ($folder in '40_scripts', '50_settings') {
             $destination = Join-Path $root $folder
             $null = [IO.Directory]::CreateDirectory($destination)
@@ -38,7 +38,10 @@ Describe 'MDH installer' {
         (Get-FileHash -LiteralPath $profileFile).Hash | Should Be $hash
         (Get-Item -LiteralPath $profileFile).LastWriteTimeUtc | Should Be $original.LastWriteTimeUtc
         . $profileFile
-        (Get-Command daily, todo, quicklinks, mdstart, md-db, mdsearch, mdreverse, mdrun).Count | Should Be 8
+        (Get-Command daily, mdtoday, todo, quicklinks, mdstart, md-db, mdsearch, mdreverse, mdrun, mdversion, mdlist, mdhelp).Count | Should Be 12
+        (mdversion -Raw).version | Should Be ([IO.File]::ReadAllText((Join-Path $repository 'VERSION')).Trim())
+        (mdlist -Raw).status | Should Be 'success'
+        (mdhelp mdversion).Synopsis | Should Match 'バージョン'
         @(Get-ChildItem -LiteralPath (Join-Path $root '01_Daily') -Recurse).Count | Should Be 0
         Test-Path -LiteralPath (Join-Path $root '00_QuickNotes/00_TODO.md') | Should Be $false
     }

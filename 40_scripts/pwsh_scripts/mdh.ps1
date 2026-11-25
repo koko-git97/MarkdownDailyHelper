@@ -51,6 +51,7 @@ Remove-Variable MDHConfig, MDHConfigTemplate
 . (Join-Path $PSScriptRoot "mdh_db.ps1")
 . (Join-Path $PSScriptRoot "mdh_start.ps1")
 . (Join-Path $PSScriptRoot "mdh_aggregate.ps1")
+. (Join-Path $PSScriptRoot "mdh_management.ps1")
 
 # その他の機能は、必要に応じて追加する
 # . (Join-Path $PSScriptRoot "dotfiles.ps1")

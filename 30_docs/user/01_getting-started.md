@@ -20,7 +20,8 @@ MDH本体を配置し、PowerShell 7.1以上でそのルートに移動します
 新しい PowerShell 7 セッションで次を実行し、関数が表示されることを確認します。
 
 ```powershell
-Get-Command daily, mdtoday, todo, quicklinks, mdstart, md-db, mdsearch, mdreverse, mdrun
+mdversion
+mdhelp
 ```
 
 一部適用の場合は表示された原因を解消し、同じ入口を再実行します。[プロファイルの復旧手順](05_troubleshooting.md#インストーラーが停止したとき)も参照してください。
@@ -38,10 +39,17 @@ Windows の PowerShell 7.6.10 で動作確認しています。PowerShell 7.1 �
 初回は `50_settings/config.json` が配布テンプレートから作成され、設定された保存先ディレクトリも必要に応じて作られます。初回ロードの後は、次のコマンドで利用者向け関数が読み込まれたことを確認できます。
 
 ```powershell
-Get-Command daily, mdtoday, todo, quicklinks, mdstart, md-db, mdsearch, mdreverse, mdrun
+mdversion
+mdhelp
 ```
 
 [個人設定](02_configuration.md)で保存先を確認してから、[日常操作](03_daily-workflow.md)に進みます。`daily`、`todo`、`mdstart` はMarkdownを書き換えることがあるため、試用する場合は個人データを含まない作業コピーを使ってください。起動時のファイル表示にはVS Codeの `code` CLIが必要です。表示とDBを省略する指定は[コマンド一覧](04_commands.md)にあります。
+
+### 既存環境を更新する
+
+既存のMDH本体、利用者データ、PowerShellプロファイルをバックアップします。公開アーカイブは別フォルダーに展開します。既存の本体パスを維持し、新版の製品スクリプト、`install.ps1`、`VERSION`、ドキュメントを更新します。`50_settings/config.json`、日報、TODO、QuickNotesと既存の集約出力は保持してください。設定テンプレートや日報・ルーティンのテンプレートを利用者が変更している場合は、内容を比較して必要な変更を取り込んでください。
+
+既存の本体ルートで `.\install.ps1 -WhatIf` を実行し、設定とプロファイルの扱いを確認します。続けて `.\install.ps1` を実行し、新しいPowerShellセッションで `mdversion` を確認します。同じ本体パスとDB保存先を維持した場合、既存の索引状態は `md-db -Status` で確認できます。索引が利用できない場合は、Markdownを保持したまま `md-db -Rebuild` で再生成できます。
 
 ## Python環境を用意する
 

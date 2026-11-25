@@ -25,8 +25,11 @@ Get-Help md-db -Full
 | `mdstart` | 実装済み | 当日日報・TODO・DB索引を準備し、設定した対象を開く |
 | `mdreverse` | 実装済み | Conceptを指定して日報のTopicを集約 |
 | `mdrun` | 実装済み | 登録済みConceptを集約し、全件成功時にindexを更新 |
+| `mdversion` | 実装済み | 読み込まれているMDHの製品バージョンを確認 |
+| `mdlist` | 実装済み | 有効設定、Concept、Typeを読み取り専用で確認 |
+| `mdhelp` | 実装済み | MDH公開コマンドの一覧と標準ヘルプを表示 |
 | `md-db` | 実装済み | 検索用DBの状態確認・同期・再構築 |
-| `mdsearch` | 実装済み | 検索用DBの読取り専用検索 |
+| `mdsearch` | 実装済み | Dailyの索引とQuickNotesのMarkdownを読み取り専用で検索 |
 
 ここで「実装済み」は現行の読み込みスクリプトに関数が定義されていることを示す。PowerShell セッション内に別ソースから同名コマンドが存在する可能性までは扱わない。
 
@@ -150,7 +153,7 @@ README や設定テンプレートに関連記述があっても、以下のコ�
 
 ### Windowsのjunctionを使った集約
 
-通常の `mdreverse` と `mdrun` では、ローカルディレクトリを指すjunctionを集約ルートまたはその祖先に使えます。集約ルート内部のjunctionは、同じルート内を指す場合も拒否されます。`mdrun` のindexは解決後の集約ルート直下に書き出されます。
+通常の `mdreverse` と `mdrun` では、ローカルディレクトリを指すjunctionを集約ルートまたはその祖先に使えます。ドライブ文字形式に加え、参照先がVolume GUID形式のローカルディレクトリを指すjunctionも利用できる。GUID形式はjunction経由で扱い、出力パスの直接指定には通常のパスを使う。集約ルート内部のjunctionは、同じルート内を指す場合も拒否されます。`mdrun` のindexは解決後の集約ルート直下に書き出されます。
 
 `mdreverse -OutputPath` では、明示したexportファイルの祖先にjunctionを使えます。Daily、設定ファイル、設定テンプレートへの出力、および集約領域へのexportは、junctionを経由しても拒否されます。`-Register` の設定保存ではjunctionを含むリパースポイントを拒否します。
 
@@ -206,7 +209,22 @@ $response = mdsearch '図書 CSV' -Raw
 
 PowerShellは `$LASTEXITCODE` に操作結果を設定する。Python CLIは `contract_version`（1）、`operation`、`exit_code`、`result`、`diagnostics` を含むUTF-8 JSONを標準出力に1件返す。
 
-通常の `mdsearch` は一致行ごとに日付、Topic名（または該当検索単位の見出し）、行番号、抜粋、パスを情報ストリームに表示する。同じ検索単位の同じ行にある複数の一致は1行と数える。`-List` も通常表示と同じ。`-Raw` は一覧表示を省略して従来の構造化オブジェクトを返す。`-DebugInfo` はJSON応答の詳細を情報ストリームに表示する。`-FullPath` は表示パスを絶対パスにする。既定はMDHルート基準の相対パスで、別ドライブなど相対化できない場合は絶対パスを表示する。
+通常の `mdsearch` は検索元をセクションで分け、グループごとに見出しとパスを1回、その下に一致行を行番号順で表示する。件数はTopic、その他のDailyグループ、QuickNotesのファイル、グループ内の異なる一致行を区別する。原文ハッシュが一致しない場合やSTALEの場合は索引上の行番号と抜粋を表示する。`-List` は通常表示と同じ。`-FullPath` で絶対パスを表示し、外部保存先は既定でも絶対パスを表示する。`-DebugInfo` は構造化応答を情報ストリームに表示する。
+
+```powershell
+mdsearch "SQLite index" -Scope Daily
+mdsearch "SQLite index" -Scope QuickNotes
+mdsearch "SQLite index" -Scope All -From '2026-11-01'
+$response = mdsearch "SQLite index" -Scope All -Raw
+```
+
+`-Scope` の既定は `Daily`。Dailyは索引上の同一検索グループ、QuickNotesは同一ファイルを単位として、空白区切りの語をANDで検索する。ASCII英字のみ大文字・小文字を同一視する。`QuickNotes` は `paths.quicknotes` 以下のMarkdown全体を読み取り専用で検索し、Daily DBの初期化や同期は不要。編集内容は次回の検索に反映する。配下のjunction、シンボリックリンク、未対応のリパースポイントは追跡せず、除外を診断に記録する。
+
+QuickNotes内のハードリンクは、リンク数にかかわらず通常のMarkdownとして検索する。ルート外のファイル名と同じファイル実体を共有する場合も、その内容が検索対象になる。検索ルートはファイルの探索範囲を定めるもので、アクセス権限を分離するセキュリティ境界ではない。集約出力では引き続きハードリンクを拒否する。
+
+`-From`、`-To`、`-IncludeStale` はDailyの条件で、`QuickNotes` 単独では指定できない。`All` はDaily、QuickNotesの順に表示し、期間指定はDailyに適用する。
+
+Dailyの `-Raw` は従来の構造化応答を返す。QuickNotesとAllの `-Raw` は `search_contract_version: 1` の応答を1件返し、実行した検索元の状態と結果を `sources` に含める。Allの `sources.daily.response` は従来のDaily応答そのもの。状態は `success`、`partial`、`error` で、`$LASTEXITCODE` は順に0、1、4。検索要求が不正な場合は実行前に終了コード2を返す。個別ファイルを読めずに続行した場合はQuickNotes結果の `incomplete` と `diagnostics` を確認する。エラー時は構造化応答を成功ストリームに送ってからエラーストリームに通知する。`-ErrorAction Stop` で中断しても応答を保持したい場合は、パイプラインで受け取った応答を処理する。
 
 索引と原文のSHA-256が一致する場合は一致行を表示し、対応する端末では一致語を色で強調する。SHA不一致・原文不在・読取り不能・STALEの場合は索引の抜粋を使い、行番号を `索引 L24` のように表示する。`-Raw` の位置は常に `snapshot_hash` が識別する索引元の位置。0件の場合は日本語の案内を表示し、不完全の可能性がある場合は除外件数と最終完全成功日時を表示する。
 
@@ -225,3 +243,12 @@ PowerShellは `$LASTEXITCODE` に操作結果を設定する。Python CLIは `co
 `md-db -Status` は索引の日報ルートを `daily_root`、現在の設定を `configured_daily_root`、照合結果を `daily_root_matches` で返す。不一致時はStatusと検索が警告し、終了コード4を返す。検索結果の表示は省略する。
 
 導入は[取扱説明書](01_getting-started.md)、異常時は運用・検証を参照。
+
+## 管理コマンド
+
+- `mdversion` は読み込み元の製品ルートにある `VERSION` を表示します。`-Raw` は `product` と `version` を持つPowerShellオブジェクト1件を返します。
+- `mdlist [config|concept|type]` の既定は `config` です。`config` はセッションで解決済みのパス、日報・TODO・DB・Python設定、Startupの指定順を表示します。Startupの動的プレースホルダーは設定値のまま表示します。Conceptは実行時に設定ファイルから読み直します。
+- `mdlist concept` は登録名、Category、キーワード、登録件数を表示します。`-Count` はconcept専用で、集約と同じ照合規則でDaily Markdownを一度走査します。集計失敗時は定義を保持し、`topic_count` を `null` とします。
+- `mdlist type` はDaily Markdownの集約対象Topicを既存のType正規化規則でまとめます。代表名には集約順で最初の表記を用います。未分類は `name`・`key` ともに `null` です。合計件数はSQLiteの全Topic件数と異なる場合があります。
+- `mdlist -Raw` は `contract_version`、`target`、`status`、`result`、`diagnostics` を持つPowerShellオブジェクト1件を返します。取得結果は `success`、`partial`、`error` のいずれかです。不正な引数は引数エラーになります。
+- `mdhelp` は全公開コマンドと概要を表示します。`mdhelp mdsearch -Examples` のように個別ヘルプを参照できます。`-Detailed`・`-Examples`・`-Full` はコマンド名とともに1つだけ指定します。

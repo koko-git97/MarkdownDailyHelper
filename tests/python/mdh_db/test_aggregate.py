@@ -1,22 +1,40 @@
 from contextlib import contextmanager
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import unquote, urlsplit
 
 from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "40_scripts" / "py_scripts"))
 
+from mdh_db import aggregate_output as output
 from mdh_db.aggregate import AggregateError, collect_entries, conflicts, filename_part, relative_url, split_type
 from mdh_db.aggregate_cli import _arguments, _execute
 from mdh_db.aggregate_markdown import render_topics
-from mdh_db.aggregate_output import _writer, generated_bytes, publish
+from mdh_db.aggregate_output import (_canonical_volume_path, _check_spelling, _junction_destination, _location, _physically_within,
+                                     _resolve, _writer, generated_bytes, publish)
+
+
+def volume_alias(path):
+    """Get the fixture volume's GUID without altering its mount points."""
+    import ctypes
+    from ctypes import wintypes
+
+    get_volume = ctypes.WinDLL("kernel32", use_last_error=True).GetVolumeNameForVolumeMountPointW
+    get_volume.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    get_volume.restype = wintypes.BOOL
+    buffer = ctypes.create_unicode_buffer(128)
+    if not get_volume(path.anchor, buffer, len(buffer)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return Path(buffer.value).joinpath(*path.parts[1:])
 
 
 class AggregateTests(unittest.TestCase):
@@ -136,6 +154,42 @@ class AggregateTests(unittest.TestCase):
         self.assertTrue(any("Reference" in warning for warning in report["warnings"]))
         self.assertFalse(self.aggregate.exists())
         self.assertEqual(path.read_bytes(), source)
+
+    def test_table_images_and_links_rebase_without_rewriting_cells(self):
+        header = r'| ![Picture](picture.png) | ![Picture](picture.png) |'
+        separator = '| :--- | ---: |'
+        row = r'| ![A\|B](<picture.png> "title") | [file](notes.txt?q=a\|b#part) |'
+        mixed = r'| `![code](keep.png)` ![Picture](picture.png) | ![Web](https://example.org/a.png) |'
+        nested = '> ![Picture](picture.png) | Text\n> --- | ---\n> [file](notes.txt) | note'
+        fenced = '\n'.join(("~~~md", header, separator, row, "~~~"))
+        path = self.write_daily("2026-11-23", "\n".join((
+            "## Alpha", "", header, separator, row, mixed, "", nested, "", fenced, "",
+        )))
+        picture = path.with_name("picture.png")
+        notes = path.with_name("notes.txt")
+        picture.touch()
+        notes.touch()
+        original = path.read_bytes()
+        self.set_concepts({"Alpha": {}})
+        export = self.root / "exports" / "nested" / "report.md"
+
+        for operation, options, output_path in (
+            ("run", (), self.aggregate / "Alpha.md"),
+            ("reverse", ("--concept=Alpha", f"--output={export}"), export),
+        ):
+            with self.subTest(operation=operation):
+                code, report, issues = self.command(operation, *options)
+                self.assertEqual((code, issues), (0, []))
+                self.assertEqual(report["warnings"], [])
+                image_url = relative_url(picture, output_path.parent)
+                notes_url = relative_url(notes, output_path.parent)
+                body = output_path.read_text(encoding="utf-8")
+                self.assertIn("\n".join((header.replace("picture.png", image_url), separator,
+                                         row.replace("picture.png", image_url).replace("notes.txt", notes_url),
+                                         mixed.replace("picture.png", image_url))), body)
+                self.assertIn(nested.replace("picture.png", image_url).replace("notes.txt", notes_url), body)
+                self.assertIn(fenced, body)
+        self.assertEqual(path.read_bytes(), original)
 
     def test_unregistered_export_and_zero_topic_file_protection(self):
         self.write_daily("2026-11-23", "## Alpha\nbody\n")
@@ -411,6 +465,348 @@ class AggregateTests(unittest.TestCase):
                        check=True, capture_output=True)
         self.addCleanup(lambda: alias.rmdir() if os.path.lexists(alias) else None)
 
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID paths")
+    def test_guid_spelling_and_missing_ancestor_identity(self):
+        import stat
+        from types import SimpleNamespace
+
+        root = volume_alias(self.root)
+        _check_spelling(Path(root.anchor), allow_volume=True)
+        final = _canonical_volume_path(root / "missing" / "folder")
+        self.assertEqual(_location(final), _location(self.root / "missing" / "folder"))
+        for invalid in (root, Path(r"\\?\Volume{bad}\folder"), Path(r"\\server\share\folder"),
+                        Path(r"\\?\GLOBALROOT\Device\folder"), Path(r"\\.\C:\folder"),
+                        root / ".." / "folder", root / "NUL"):
+            with self.subTest(path=invalid), self.assertRaises(AggregateError):
+                _check_spelling(invalid, allow_volume=invalid != root)
+        self.assertEqual(_location(root / "missing" / "file.md"),
+                         _location(self.root / "missing" / "FILE.md"))
+        self.assertNotEqual(_location(root / "elsewhere" / "file.md"),
+                            _location(self.root / "missing" / "file.md"))
+        self.assertTrue(_physically_within(root / "missing" / "file.md", self.root / "missing"))
+        self.assertFalse(_physically_within(root / "elsewhere" / "file.md", self.root / "missing"))
+        info = SimpleNamespace(st_reparse_tag=stat.IO_REPARSE_TAG_MOUNT_POINT,
+                               st_file_attributes=stat.FILE_ATTRIBUTE_DIRECTORY)
+        for invalid in (Path(root.anchor), root.anchor.rstrip("\\"), r"\\?\Volume{bad}\folder",
+                        r"\\?\UNC\server\share\folder", r"\\?\GLOBALROOT\Device\folder", r"C:relative"):
+            with self.subTest(destination=invalid), patch("mdh_db.aggregate_output.os.readlink", return_value=str(invalid)):
+                with self.assertRaises(AggregateError):
+                    _junction_destination(self.root / "link", info)
+        self.assertEqual(relative_url(root / "file.md", root), "file.md")
+        self.assertTrue(relative_url(self.root / "file.md", root).startswith("file:///"))
+        with self.assertRaises(AggregateError):
+            relative_url(root / "file.md", self.root)
+        with patch("mdh_db.aggregate_output._canonical_volume_path", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                _resolve(root)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows API bindings")
+    def test_canonical_volume_path_windows_api_branches(self):
+        import ctypes
+
+        path = self.root / "missing"
+        guid = volume_alias(self.root)
+        invalid = ctypes.c_void_p(-1).value
+        cases = (
+            ("DOS", [7], 0, [(4, 0, str(path))], [0], path, None),
+            ("GUID fallback", [7], 0, [(0, 3, None), (4, 0, str(guid / path.name))],
+             [0, 1], guid / path.name, None),
+            ("GUID failure", [7], 0, [(0, 3, None), (0, 3, None)], [0, 1], None, 3),
+            ("missing", [invalid, 7], 2, [(4, 0, str(self.root))], [0], path, None),
+            ("open denied", [invalid], 5, [], [], None, 5),
+            ("query denied", [7], 0, [(0, 5, None)], [0], None, 5),
+            ("buffer full", [7], 0, [(32768, 0, None)], [0], None, "too long"),
+        )
+        for name, handles, open_error, replies, flags, expected, error in cases:
+            with self.subTest(case=name):
+                kernel = Mock()
+                kernel.CreateFileW.side_effect = handles
+                responses = iter(replies)
+
+                def final_name(handle, buffer, capacity, mode):
+                    size, last_error, value = next(responses)
+                    ctypes.set_last_error(last_error)
+                    if value is not None:
+                        buffer.value = value
+                    return size
+
+                kernel.GetFinalPathNameByHandleW.side_effect = final_name
+                ctypes.set_last_error(open_error)
+                with patch.object(ctypes, "WinDLL", return_value=kernel):
+                    if error is None:
+                        self.assertEqual(_canonical_volume_path(path), expected)
+                    elif error == "too long":
+                        with self.assertRaisesRegex(AggregateError, error):
+                            _canonical_volume_path(path)
+                    else:
+                        with self.assertRaises(OSError) as raised:
+                            _canonical_volume_path(path)
+                        self.assertEqual(raised.exception.winerror, error)
+                opened = [call.args[0] for call in kernel.CreateFileW.call_args_list]
+                self.assertEqual(opened, [str(item) for item in (path, *path.parents)][:len(handles)])
+                self.assertEqual([call.args[3] for call in kernel.GetFinalPathNameByHandleW.call_args_list], flags)
+                self.assertEqual([call.args[0] for call in kernel.CloseHandle.call_args_list],
+                                 [handle for handle in handles if handle != invalid])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows path aliases")
+    def test_export_rejects_existing_and_missing_daily_paths_through_aliases(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.daily = self.root / "Long Daily Directory"
+        self.daily.mkdir()
+        self.set_concepts({"Alpha": {}})
+        daily = self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        before = daily.read_bytes()
+        dos = self.root / "DOS"
+        guid = self.root / "GUID"
+        self.junction(dos, self.daily)
+        self.junction(guid, volume_alias(self.daily))
+        aliases = [self.daily, Path(str(self.daily).upper()), dos, guid]
+        short_name = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+        short_name.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        short_name.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = short_name(str(self.daily), buffer, len(buffer))
+        if 0 < size < len(buffer) and Path(buffer.value) != self.daily:
+            aliases.append(Path(buffer.value))
+        for alias in aliases:
+            for relative in (daily.relative_to(self.daily), Path("missing.md")):
+                with self.subTest(alias=alias, relative=relative):
+                    code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={alias / relative}")
+                    self.assertEqual(code, 4)
+                    self.assertIn("Protected output", issues[0]["message"])
+        self.assertEqual(daily.read_bytes(), before)
+        self.assertFalse((self.daily / "missing.md").exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID junctions")
+    def test_guid_ancestor_chain_publish_links_and_protection(self):
+        actual = self.root / "集約 実体"
+        actual.mkdir()
+        guid_alias = self.root / "GUID link"
+        self.junction(guid_alias, volume_alias(actual))
+        self.assertIn("Volume{", os.readlink(guid_alias))
+        outer = self.root / "DOS link"
+        self.junction(outer, guid_alias)
+        self.aggregate = outer / "new" / "inner"
+        self.set_concepts({"Alpha": {"category": "Work"}})
+        daily = self.write_daily("2026-11-23", "## Alpha\n[asset](asset.txt)\n")
+        asset = daily.with_name("asset.txt")
+        asset.write_bytes(b"asset")
+        original = daily.read_bytes(), self.config.read_bytes(), asset.read_bytes()
+        self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 0)
+        target = actual / "new" / "inner" / "Work" / "Alpha.md"
+        content = target.read_text(encoding="utf-8")
+        self.assertIn(relative_url(daily, target.parent), content)
+        self.assertIn(relative_url(asset, target.parent), content)
+        self.assertNotIn("file:", content)
+        self.assertEqual(self.command("run")[0], 0)
+        index = target.parent.parent / "index.md"
+        self.assertIn("[Alpha](Work/Alpha.md)", index.read_text(encoding="utf-8"))
+        self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={guid_alias / 'export.md'}")[0], 0)
+
+        protected_alias = self.root / "daily alias"
+        self.junction(protected_alias, volume_alias(self.daily))
+        config_alias = self.root / "config alias"
+        self.junction(config_alias, volume_alias(self.config.parent))
+        for path in (protected_alias / "blocked.md", config_alias / "config.json",
+                     config_alias / "config.template.json", guid_alias / "new" / "inner" / "blocked.md"):
+            with self.subTest(path=path):
+                code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={path}")
+                self.assertEqual(code, 4)
+                self.assertIn("Protected output", issues[0]["message"])
+        self.assertEqual((daily.read_bytes(), self.config.read_bytes(), asset.read_bytes()), original)
+        self.assertFalse((self.daily / "blocked.md").exists())
+        self.assertFalse(self.config.with_name("config.template.json").exists())
+
+        self.set_concepts({"Alpha": {"category": "internal"}})
+        internal = target.parent.parent / "internal"
+        self.junction(internal, volume_alias(actual))
+        code, _, issues = self.command("reverse", "--concept=Alpha")
+        self.assertEqual(code, 4)
+        self.assertIn("at or above", issues[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID junctions")
+    def test_mixed_guid_cycle_and_missing_target_are_rejected(self):
+        first = self.root / "first"
+        second = self.root / "second"
+        self.junction(first, volume_alias(second))
+        self.aggregate = first
+        self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        code, _, issues = self.command("reverse", "--concept=Alpha")
+        self.assertEqual(code, 4)
+        self.assertIn("destination is missing", issues[0]["message"])
+        self.junction(second, first)
+        code, _, issues = self.command("reverse", "--concept=Alpha")
+        self.assertEqual(code, 4)
+        self.assertIn("circular", issues[0]["message"])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID paths")
+    def test_guid_without_dos_name_keeps_index_links_relative(self):
+        actual = self.root / "actual"
+        actual.mkdir()
+        self.junction(self.aggregate, volume_alias(actual))
+        daily = self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        self.set_concepts({"Alpha": {}})
+        daily_alias = self.root / "daily alias"
+        self.junction(daily_alias, volume_alias(self.daily))
+        settings = self.root / "settings alias"
+        self.junction(settings, volume_alias(self.config.parent))
+        before = daily.read_bytes(), self.config.read_bytes()
+        # The real GUID path is usable. Simulate only the absence of a DOS final name.
+        with patch("mdh_db.aggregate_output._canonical_volume_path", side_effect=lambda path: path):
+            code, _, issues = self.command("run")
+            for protected in (daily_alias / "blocked.md", settings / "config.json",
+                              settings / "config.template.json", actual / "blocked.md"):
+                with self.subTest(protected=protected):
+                    failure, _, diagnostics = self.command("reverse", "--concept=Alpha", f"--output={protected}")
+                    self.assertEqual(failure, 4)
+                    self.assertIn("Protected output", diagnostics[0]["message"])
+        self.assertEqual((code, issues), (0, []))
+        self.assertEqual((daily.read_bytes(), self.config.read_bytes()), before)
+        self.assertFalse((actual / "blocked.md").exists())
+        self.assertIn(daily.as_uri(), (actual / "Alpha.md").read_text(encoding="utf-8"))
+        self.assertIn("[Alpha](Alpha.md)", (actual / "index.md").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID junctions")
+    def test_guid_junction_retarget_before_publish_keeps_original(self):
+        old = self.root / "old"
+        new = self.root / "new"
+        old.mkdir()
+        new.mkdir()
+        self.junction(self.aggregate, volume_alias(old))
+        self.write_daily("2026-11-23", "## Alpha\nold\n")
+        self.assertEqual(self.command("reverse", "--concept=Alpha")[0], 0)
+        original = (old / "Alpha.md").read_bytes()
+        self.write_daily("2026-11-23", "## Alpha\nchanged\n")
+        fsync = os.fsync
+
+        def retarget(fd):
+            fsync(fd)
+            self.aggregate.rmdir()
+            self.junction(self.aggregate, volume_alias(new))
+
+        with patch("mdh_db.aggregate_output.os.fsync", side_effect=retarget):
+            code, _, issues = self.command("reverse", "--concept=Alpha")
+        self.assertEqual(code, 4)
+        self.assertIn("Output directory changed", issues[0]["message"])
+        self.assertEqual((old / "Alpha.md").read_bytes(), original)
+        self.assertEqual(list(old.iterdir()), [old / "Alpha.md"])
+        self.assertFalse(list(new.iterdir()))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows mutexes and volume paths")
+    def test_mutex_blocks_a_separate_process_using_guid_spelling(self):
+        script = """
+import ctypes
+from ctypes import wintypes
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from mdh_db.aggregate_output import _writer
+
+win_dll = ctypes.WinDLL
+
+def observe_wait(*args, **kwargs):
+    kernel = win_dll(*args, **kwargs)
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait.restype = wintypes.DWORD
+
+    def observed(handle, timeout):
+        result = wait(handle, 0)
+        if result == 258:  # WAIT_TIMEOUT: the kernel confirmed contention.
+            Path(sys.argv[3]).touch()
+            return wait(handle, timeout)
+        return result
+
+    kernel.WaitForSingleObject = observed
+    return kernel
+
+ctypes.WinDLL = observe_wait
+with _writer(Path(sys.argv[2])):
+    print("locked", flush=True)
+"""
+        package = str(Path(__file__).resolve().parents[3] / "40_scripts" / "py_scripts")
+        dos = self.root / "lock.md"
+        guid = volume_alias(dos)
+        other = self.root / "other"
+        other.mkdir()
+
+        def command(path, marker):
+            return [sys.executable, "-B", "-c", script, package, str(path), str(marker)]
+
+        def assert_uncontended(path, label):
+            marker = self.root / label
+            result = subprocess.run(command(path, marker), capture_output=True, text=True, timeout=8)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "locked")
+            self.assertFalse(marker.exists())
+
+        assert_uncontended(guid, "control")
+        legacy_key = sha256(str(dos).upper().encode("utf-8")).hexdigest()
+        for label, parent, path in (("physical", _writer(dos), guid),
+                                    ("legacy", output._windows_mutex(legacy_key, dos), dos)):
+            with self.subTest(mutex=label):
+                marker = self.root / label
+                child = None
+                try:
+                    with parent:
+                        if label == "physical":
+                            assert_uncontended(self.root / "different.md", "different-name")
+                            assert_uncontended(other / dos.name, "different-parent")
+                        child = subprocess.Popen(command(path, marker), stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE, text=True)
+                        deadline = time.monotonic() + 8
+                        while not marker.exists():
+                            if child.poll() is not None:
+                                stdout, stderr = child.communicate(timeout=2)
+                                self.fail(f"Child exited before contention ({child.returncode}): {stdout}{stderr}")
+                            if time.monotonic() >= deadline:
+                                child.kill()
+                                stdout, stderr = child.communicate(timeout=5)
+                                self.fail(f"Child did not report kernel contention: {stdout}{stderr}")
+                            time.sleep(0.01)
+                        self.assertIsNone(child.poll())
+                    stdout, stderr = child.communicate(timeout=8)
+                    self.assertEqual(child.returncode, 0, stderr)
+                    self.assertEqual(stdout.strip(), "locked")
+                finally:
+                    if child is not None:
+                        if child.poll() is None:
+                            child.kill()
+                        child.communicate(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows mutex ordering")
+    def test_mutex_order_and_first_release_if_second_fails(self):
+        path = self.root / "lock.md"
+        device, inode = _location(self.root)[0]
+        physical = sha256(f"physical:{device}:{inode}:{path.name.upper()}".encode("utf-8")).hexdigest()
+        legacy = sha256(str(path).upper().encode("utf-8")).hexdigest()
+        events = []
+
+        @contextmanager
+        def traced_mutex(key, target):
+            events.append(("acquire", key))
+            if fail_second and key == legacy:
+                raise AggregateError("second lock failed")
+            try:
+                yield
+            finally:
+                events.append(("release", key))
+
+        with patch.object(output, "_windows_mutex", traced_mutex):
+            fail_second = False
+            with _writer(path):
+                events.append(("body", None))
+            self.assertEqual(events, [("acquire", physical), ("acquire", legacy), ("body", None),
+                                      ("release", legacy), ("release", physical)])
+            events.clear()
+            fail_second = True
+            with self.assertRaisesRegex(AggregateError, "second lock failed"), _writer(path):
+                self.fail("writer entered after second mutex failed")
+        self.assertEqual(events, [("acquire", physical), ("acquire", legacy), ("release", physical)])
+
     def test_export_refuses_a_symbolic_link(self):
         self.write_daily("2026-11-23", "## Alpha\nbody\n")
         actual = self.root / "actual"
@@ -604,6 +1000,102 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual((moved / path.name).read_bytes(), content)
         self.assertFalse(path.exists())
         self.assertEqual(next(directory.glob(".mdh-*.tmp")).read_bytes(), b"unrelated")
+
+    def test_reverse_rejects_existing_output_without_identity(self):
+        self.set_concepts({"Alpha": {}})
+        self.write_daily("2026-11-23", "## Alpha\noriginal\n")
+        args = ("reverse", "--concept=Alpha")
+        self.assertEqual(self.command(*args)[0], 0)
+        path = self.aggregate / "Alpha.md"
+        original = path.read_bytes()
+        self.write_daily("2026-11-23", "## Alpha\nchanged\n")
+        inspect = output._inspect
+
+        def inspect_without_inode(candidate):
+            info, linked = inspect(candidate)
+            if candidate == path:
+                info = os.stat_result((*info[:1], 0, *info[2:]))
+            return info, linked
+
+        with patch.object(output, "_inspect", side_effect=inspect_without_inode):
+            code, _, issues = self.command(*args)
+        self.assertEqual(code, 4)
+        self.assertIn("Cannot identify", issues[0]["message"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(self.aggregate.iterdir()), [path])
+
+    def test_reverse_keeps_replacement_when_temporary_inode_is_unavailable(self):
+        self.set_concepts({"Alpha": {}})
+        self.write_daily("2026-11-23", "## Alpha\noriginal\n")
+        args = ("reverse", "--concept=Alpha")
+        self.assertEqual(self.command(*args)[0], 0)
+        path = self.aggregate / "Alpha.md"
+        original = path.read_bytes()
+        self.write_daily("2026-11-23", "## Alpha\nchanged\n")
+        fstat = os.fstat
+        inspect = output._inspect
+        temporary = None
+
+        @contextmanager
+        def replace_after_close(**kwargs):
+            nonlocal temporary
+            with NamedTemporaryFile(**kwargs) as handle:
+                temporary = Path(handle.name)
+                try:
+                    yield handle
+                finally:
+                    handle.close()
+                    temporary.rename(self.aggregate / "displaced.tmp")
+                    temporary.write_bytes(b"unrelated replacement")
+
+        def zero_inode(info):
+            return os.stat_result((*info[:1], 0, *info[2:]))
+
+        def inspect_without_inode(candidate):
+            info, linked = inspect(candidate)
+            return (zero_inode(info) if candidate == temporary else info), linked
+
+        for issue_at_creation in (True, False):
+            with self.subTest(issue_at_creation=issue_at_creation):
+                with patch.object(output, "NamedTemporaryFile", replace_after_close), patch.object(
+                        output, "_inspect", side_effect=inspect_without_inode), patch.object(
+                        output.os, "fstat", side_effect=lambda fd: zero_inode(fstat(fd)) if issue_at_creation else fstat(fd)):
+                    if issue_at_creation:
+                        with patch.object(output.os, "fsync", side_effect=OSError("injected write interruption")):
+                            code, _, issues = self.command(*args)
+                        self.assertEqual(code, 4)
+                        self.assertIn("Temporary output retained", issues[0]["message"])
+                    else:
+                        with self.assertLogs(output.__name__, level="WARNING") as logs:
+                            code, _, issues = self.command(*args)
+                        self.assertIn("Temporary output retained", logs.output[0])
+                        self.assertIn("Cannot identify", issues[0]["message"])
+                self.assertEqual(code, 4)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(temporary.read_bytes(), b"unrelated replacement")
+                self.assertTrue((self.aggregate / "displaced.tmp").is_file())
+                temporary.unlink()
+                (self.aggregate / "displaced.tmp").unlink()
+
+    def test_reverse_does_not_skip_unidentifiable_existing_ancestor(self):
+        self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        ancestor = self.root / "existing"
+        ancestor.mkdir()
+        path = ancestor / "missing" / "report.md"
+        inspect = output._inspect
+
+        def inspect_without_inode(candidate):
+            info, linked = inspect(candidate)
+            if candidate == ancestor:
+                info = os.stat_result((*info[:1], 0, *info[2:]))
+            return info, linked
+
+        with patch.object(output, "_inspect", side_effect=inspect_without_inode):
+            code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={path}")
+        self.assertEqual(code, 4)
+        self.assertIn("Cannot identify", issues[0]["message"])
+        self.assertIn(str(ancestor), issues[0]["message"])
+        self.assertFalse(list(ancestor.iterdir()))
 
     def test_hard_link_and_temporary_write_failure_preserve_original(self):
         path = self.root / "report.md"

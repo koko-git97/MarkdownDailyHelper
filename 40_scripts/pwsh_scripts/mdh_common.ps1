@@ -1,3 +1,8 @@
+function Get-MdhPublicCommandNames {
+    'mdstart', 'daily', 'mdtoday', 'todo', 'quicklinks', 'md-db', 'mdsearch',
+    'mdreverse', 'mdrun', 'mdversion', 'mdlist', 'mdhelp'
+}
+
 # 許可されたパス参照を一度だけ展開する。
 function Expand-MdhPathPlaceholders {
     param(

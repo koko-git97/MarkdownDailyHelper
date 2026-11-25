@@ -213,7 +213,7 @@ try {
     $scripts = Join-Path $root '40_scripts/pwsh_scripts'
     $loader = Join-Path $scripts 'mdh.ps1'
     foreach ($name in @('mdh', 'mdh_common', 'mdh_init', 'mdh_daily', 'mdh_todo',
-            'mdh_quicklinks', 'mdh_db', 'mdh_start', 'mdh_aggregate')) {
+            'mdh_quicklinks', 'mdh_db', 'mdh_start', 'mdh_aggregate', 'mdh_management')) {
         if (-not (Test-Path -LiteralPath (Join-Path $scripts "$name.ps1") -PathType Leaf)) {
             throw "必須スクリプトがありません: $name.ps1"
         }
@@ -226,8 +226,9 @@ try {
     $templatePath = Join-Path $root '50_settings/config.template.json'
     $createConfig = (Get-FileStamp $configPath) -eq 'missing'
     $inputPath = if ($createConfig) { $templatePath } else { $configPath }
-    foreach ($relative in @('50_settings/config.template.json', '50_settings/templates/DailyTemplate.md',
+    foreach ($relative in @('VERSION', '50_settings/config.template.json', '50_settings/templates/DailyTemplate.md',
             '50_settings/templates/TodoRoutine.md', '40_scripts/py_scripts/mdh_db/__main__.py',
+            '40_scripts/py_scripts/mdh_db/management_cli.py',
             '40_scripts/py_scripts/mdh_db/requirements.txt')) {
         if (-not (Test-Path -LiteralPath (Join-Path $root $relative) -PathType Leaf)) {
             throw "必須ファイルがありません: $relative"
@@ -329,7 +330,8 @@ try {
     $verify = @"
 `$ErrorActionPreference = 'Stop'
 . $quotedLoader -RequireExisting
-Get-Command daily, mdtoday, todo, quicklinks, mdstart, md-db, mdsearch, mdreverse, mdrun -CommandType Function -ErrorAction Stop | Out-Null
+Get-Command -Name (Get-MdhPublicCommandNames) -CommandType Function -ErrorAction Stop | Out-Null
+mdversion -Raw | Out-Null
 "@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($verify))
     & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -NonInteractive -EncodedCommand $encoded

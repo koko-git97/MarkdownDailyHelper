@@ -168,6 +168,35 @@ def _like_pattern(term: str) -> str:
     return f"%{literal}%"
 
 
+def query_terms(query: str) -> tuple[str, ...]:
+    if "\x00" in query:
+        raise ValueError("Search query must not contain NUL")
+    return tuple(dict.fromkeys(query.split()))
+
+
+def matches_in_span(body, term, start, line, column, *, require_match=False, folded=None):
+    """Yield the first match per source line, using code-point positions."""
+    haystack = body.translate(ASCII_LOWER) if folded is None else folded
+    needle = term.translate(ASCII_LOWER)
+    index = haystack.find(needle)
+    if index < 0 and require_match:
+        raise DatabaseIntegrityError("SQLite LIKE and source position matching disagree")
+    line_start = 0
+    for newline in EOL.finditer(body):
+        if index == -1:
+            break
+        if index < newline.start():
+            stop = index + len(term)
+            yield Match(term, start + index, start + stop, line,
+                        column + index - line_start, body[index:stop])
+            index = haystack.find(needle, newline.end())
+        line_start, line, column = newline.end(), line + 1, 1
+    if index != -1:
+        stop = index + len(term)
+        yield Match(term, start + index, start + stop, line,
+                    column + index - line_start, body[index:stop])
+
+
 def _matched_groups(db, terms, accepted, lower, upper) -> tuple[SearchHit, ...]:
     if not terms:
         return ()
@@ -197,25 +226,8 @@ def _matched_groups(db, terms, accepted, lower, upper) -> tuple[SearchHit, ...]:
     hits = {}
     for *key, start, line, column, body, term_id in rows:
         term = terms[term_id]
-        haystack, needle = body.translate(ASCII_LOWER), term.translate(ASCII_LOWER)
-        index = haystack.find(needle)
-        if index < 0:
-            raise DatabaseIntegrityError("SQLite LIKE and source position matching disagree")
         matches = hits.setdefault(tuple(key), [])
-        line_start = 0
-        for newline in EOL.finditer(body):
-            if index == -1:
-                break
-            if index < newline.start():
-                stop = index + len(term)
-                matches.append(Match(term, start + index, start + stop, line,
-                                     column + index - line_start, body[index:stop]))
-                index = haystack.find(needle, newline.end())
-            line_start, line, column = newline.end(), line + 1, 1
-        if index != -1:
-            stop = index + len(term)
-            matches.append(Match(term, start + index, start + stop, line,
-                                 column + index - line_start, body[index:stop]))
+        matches.extend(matches_in_span(body, term, start, line, column, require_match=True))
     return tuple(SearchHit(*key, tuple(matches)) for key, matches in hits.items())
 
 
@@ -228,9 +240,7 @@ def search(path: Path, query: str, *, include_stale: bool = False,
     """
     if after is not None and before is not None and after > before:
         raise ValueError("Search start date must not be after its end date")
-    if "\x00" in query:
-        raise ValueError("Search query must not contain NUL")
-    terms = tuple(dict.fromkeys(query.split()))
+    terms = query_terms(query)
     accepted = ("CURRENT", "STALE") if include_stale else ("CURRENT",)
     lower = after.isoformat() if after is not None else None
     upper = before.isoformat() if before is not None else None

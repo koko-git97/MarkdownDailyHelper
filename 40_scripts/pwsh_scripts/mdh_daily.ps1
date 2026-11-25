@@ -249,6 +249,24 @@ function ConvertTo-MdhDailyAppointmentResult {
     }
 }
 
+function Get-MdhDailyTemplatePath {
+    $config = $script:MDH_CONFIG
+    $templateValue = [string]$config.daily.template
+    if ([string]::IsNullOrWhiteSpace($templateValue)) {
+        throw 'config.daily.template が設定されていません。'
+    }
+
+    if ([System.IO.Path]::IsPathRooted($templateValue)) {
+        $templateValue
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace([string]$script:MDHRoot)) {
+            throw '相対パスのテンプレートを解決するための MDHRoot が初期化されていません。'
+        }
+        Join-Path $script:MDHRoot $templateValue
+    }
+}
+
 # テンプレートを基に日報の内容を生成
 function New-MdhDailyContent {
     [CmdletBinding()]
@@ -263,21 +281,7 @@ function New-MdhDailyContent {
         [string[]]$Appointments = @()
     )
 
-    $config = $script:MDH_CONFIG
-    $templateValue = [string]$config.daily.template
-    if ([string]::IsNullOrWhiteSpace($templateValue)) {
-        throw 'config.daily.template が設定されていません。'
-    }
-
-    $templatePath = if ([System.IO.Path]::IsPathRooted($templateValue)) {
-        $templateValue
-    }
-    else {
-        if ([string]::IsNullOrWhiteSpace([string]$script:MDHRoot)) {
-            throw '相対パスのテンプレートを解決するための MDHRoot が初期化されていません。'
-        }
-        Join-Path $script:MDHRoot $templateValue
-    }
+    $templatePath = Get-MdhDailyTemplatePath
 
     if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
         throw "日報テンプレートが見つかりません: $templatePath"

@@ -15,7 +15,7 @@ Describe 'MDH CLI presentation' {
     }
 
     It 'documents every public parameter and exposes the requested help modes' {
-        foreach ($name in 'mdstart', 'daily', 'mdtoday', 'todo', 'md-db', 'quicklinks', 'mdsearch', 'mdreverse', 'mdrun') {
+        foreach ($name in 'mdstart', 'daily', 'mdtoday', 'todo', 'md-db', 'quicklinks', 'mdsearch', 'mdreverse', 'mdrun', 'mdversion', 'mdlist', 'mdhelp') {
             $help = Get-Help $name -Full
             $help.Synopsis | Should Not Match ('^' + [regex]::Escape($name) + ' \[')
             @($help.examples.example).Count | Should BeGreaterThan 0

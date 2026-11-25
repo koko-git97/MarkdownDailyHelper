@@ -7,6 +7,7 @@ import re
 from urllib.parse import quote, unquote, urlsplit
 
 from markdown_it import MarkdownIt
+from markdown_it.rules_block import table
 from markdown_it.rules_inline import image, link
 
 from .aggregate import Entry, grouped_entries, relative_url
@@ -76,6 +77,41 @@ def _inline_offsets(content: str, rows: list[str], offsets: list[int], first: in
     return positions
 
 
+def _table_cells(state, row):
+    start = state.bMarks[row] + state.tShift[row]
+    raw = state.src[start:state.eMarks[row]]
+    start += len(raw) - len(raw.lstrip())
+    raw = raw.strip()
+    separators = [-1, *(match.start() for match in re.finditer(r"(?<!\\)\|", raw)), len(raw)]
+    for left, right in zip(separators, separators[1:]):
+        if right == left + 1 and (left == -1 or right == len(raw)):
+            continue  # The table rule removes empty outer cells.
+        cell = raw[left + 1:right]
+        first = start + left + 1 + len(cell) - len(cell.lstrip())
+        cell = cell.strip()
+        # The table rule removes the backslash from escaped pipes before inline parsing.
+        chars = list(re.finditer(r"\\\||.", cell))
+        yield ("".join(match[0][-1] for match in chars),
+               [*(first + match.start() for match in chars), first + len(cell)])
+
+
+def _table_with_source_positions(state, start, stop, silent):
+    first_token = len(state.tokens)
+    matched = table(state, start, stop, silent)
+    if not matched or silent:
+        return matched
+    row = None
+    for token in state.tokens[first_token:]:
+        if token.type != "inline":
+            continue
+        if token.map[0] != row:
+            row = token.map[0]
+            cells = iter(_table_cells(state, row))
+        content, positions = next(cells, ("", None))
+        token.meta["table_positions"] = positions if content == token.content else None
+    return matched
+
+
 def _rebase(destination: str, source: Path, directory: Path, warn) -> str | None:
     if not destination or destination.startswith(("/", "\\")):
         return None
@@ -120,7 +156,9 @@ def topic_body(entry: Entry, directory: Path, warnings: list[str], env: dict) ->
         elif marker:
             pos = offsets[row] + marker.start(1)
             edits.append((pos, pos, "#"))
-    for token in MarkdownIt("commonmark").parse(body, dict(env)):
+    parser = MarkdownIt("commonmark").enable("table")
+    parser.block.ruler.at("table", _table_with_source_positions, {"alt": ["paragraph", "reference"]})
+    for token in parser.parse(body, dict(env)):
         if token.type == "html_block" and re.search(r"\b(?:href|src)\s*=", token.content, re.I):
             warn("HTML link kept unchanged")
         if token.type != "inline":
@@ -130,9 +168,11 @@ def topic_body(entry: Entry, directory: Path, warnings: list[str], env: dict) ->
             warn("Reference or HTML link kept unchanged")
         if not spans:
             continue
-        positions = _inline_offsets(token.content, rows, offsets, *token.map)
+        in_table = "table_positions" in token.meta
+        positions = (token.meta["table_positions"] if in_table
+                     else _inline_offsets(token.content, rows, offsets, *token.map))
         for start, stop, destination in spans:
-            if positions is None or positions[stop - 1] - positions[start] != stop - start - 1:
+            if positions is None or (not in_table and positions[stop - 1] - positions[start] != stop - start - 1):
                 warn(f"Could not locate source link exactly: {destination}")
                 continue
             replacement = _rebase(destination, entry.path, directory, warn)
@@ -140,7 +180,10 @@ def topic_body(entry: Entry, directory: Path, warnings: list[str], env: dict) ->
                 original = token.content[start:stop]
                 if original.startswith("<"):
                     replacement = "<" + replacement + ">"
-                edits.append((positions[start], positions[stop - 1] + 1, replacement))
+                if in_table:
+                    replacement = replacement.replace("|", r"\|")
+                end = positions[stop] if in_table else positions[stop - 1] + 1
+                edits.append((positions[start], end, replacement))
     for start, stop, replacement in sorted(edits, reverse=True):
         body = body[:start] + replacement + body[stop:]
     return body.strip("\n")

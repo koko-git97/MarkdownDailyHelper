@@ -240,6 +240,8 @@ def grouped_entries(entries: list[Entry]) -> list[list[Entry]]:
 def relative_url(target: Path, directory: Path) -> str:
     if os.name == "nt" and target.drive and target.drive.lower() != directory.drive.lower():
         # There is no relative path across Windows drives.
+        if target.drive.startswith("\\\\?\\"):
+            raise AggregateError(f"Cannot generate a file URI without a drive-letter target: {target}")
         return target.as_uri()
     path = Path(os.path.relpath(target, directory)).as_posix()
     return "".join(char if not char.isascii() and char.isprintable() else quote(char, safe="/")

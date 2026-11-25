@@ -75,6 +75,24 @@ Describe 'mdreverse and mdrun from the production loader' {
                 mdreverse sample -OutputPath (Join-Path $exportAlias '報告 書.md')
                 $LASTEXITCODE | Should Be 0
                 [IO.File]::ReadAllText((Join-Path $exportDirectory '報告 書.md')) | Should Match '"kind":"export"'
+
+                [IO.Directory]::Delete($aggregate)
+                $guidJunction = @'
+import os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from test_aggregate import volume_alias
+subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", sys.argv[2], str(volume_alias(Path(sys.argv[3])))],
+               check=True, capture_output=True)
+assert "Volume{" in os.readlink(sys.argv[2])
+'@
+                & $env:MDH_TEST_PYTHON_EXECUTABLE -B -c $guidJunction (Join-Path $PSScriptRoot '../python/mdh_db') $aggregate $physical
+                $LASTEXITCODE | Should Be 0
+                mdreverse sample
+                $LASTEXITCODE | Should Be 0
+                mdrun
+                $LASTEXITCODE | Should Be 0
+                [IO.File]::ReadAllText((Join-Path $physical 'index.md')) | Should Match '\[sample\]\(sample\.md\)'
             }
             finally {
                 if ([IO.Directory]::Exists($exportAlias)) { [IO.Directory]::Delete($exportAlias) }
