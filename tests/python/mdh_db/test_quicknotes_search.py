@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "40_scripts" / "py_scripts"))
 
-from mdh_db.aggregate import AggregateError
 from mdh_db.quicknotes_search import _inspect, _snapshot, search_quicknotes
 from test_aggregate import volume_alias
 
@@ -125,7 +124,7 @@ class QuickNotesSearchTests(unittest.TestCase):
         self.assertEqual(result["files_scanned"], 0)
         self.assertEqual(result["diagnostics"][0]["code"], "FILE_READ_FAILED")
 
-    def test_unidentifiable_file_keeps_other_hits(self):
+    def test_file_without_inode_is_searchable(self):
         bad = self.write("bad.md", b"word")
         self.write("good.md", b"word")
         bad_info = bad.stat()
@@ -147,18 +146,13 @@ class QuickNotesSearchTests(unittest.TestCase):
         with patch("mdh_db.quicknotes_search._inspect", side_effect=inspect), patch.object(
                 os, "fstat", side_effect=opened_info):
             result = search_quicknotes(self.root, "word")
-        self.assertTrue(result["incomplete"])
-        self.assertEqual([hit["path"] for hit in result["hits"]], ["good.md"])
-        self.assertEqual([(item["code"], item["path"]) for item in result["diagnostics"]],
-                         [("FILE_READ_FAILED", "bad.md")])
+        self.assertFalse(result["incomplete"])
+        self.assertEqual([hit["path"] for hit in result["hits"]], ["bad.md", "good.md"])
+        self.assertEqual(result["diagnostics"], [])
 
-    @unittest.skipUnless(os.name == "nt", "requires Windows reparse attributes")
-    def test_uninspectable_reparse_file_keeps_other_hits(self):
+    def test_uninspectable_file_keeps_other_hits(self):
         failed = self.write("bad.md", b"word")
         self.write("good.md", b"word")
-        from mdh_db.aggregate_output import _windows_attributes
-
-        attributes = _windows_attributes()
         lstat = Path.lstat
 
         def inspect_stat(path):
@@ -166,9 +160,7 @@ class QuickNotesSearchTests(unittest.TestCase):
                 raise FileNotFoundError(path)
             return lstat(path)
 
-        with patch("mdh_db.aggregate_output._windows_attributes", return_value=lambda p:
-                   stat.FILE_ATTRIBUTE_REPARSE_POINT if p == failed else attributes(p)), \
-                patch.object(Path, "lstat", inspect_stat):
+        with patch.object(Path, "lstat", inspect_stat):
             result = search_quicknotes(self.root, "word")
         self.assertTrue(result["incomplete"])
         self.assertEqual(result["files_scanned"], 1)
@@ -186,7 +178,7 @@ class QuickNotesSearchTests(unittest.TestCase):
             if path == child:
                 child_checks += 1
                 if child_checks > 1:
-                    raise AggregateError("child inspection failed")
+                    raise OSError("child inspection failed")
             return _inspect(path)
 
         with patch("mdh_db.quicknotes_search._inspect", side_effect=inspect):
@@ -195,14 +187,37 @@ class QuickNotesSearchTests(unittest.TestCase):
         self.assertEqual([hit["path"] for hit in result["hits"]], ["good.md"])
         self.assertEqual(result["diagnostics"][0]["code"], "DIRECTORY_READ_FAILED")
 
-        def inspect_root(path):
-            if path == self.root:
-                raise AggregateError("root inspection failed")
-            return _inspect(path)
+        fetch_stat = Path.stat
 
-        with patch("mdh_db.quicknotes_search._inspect", side_effect=inspect_root):
-            with self.assertRaisesRegex(AggregateError, "root inspection failed"):
+        def inspect_root(path, **kwargs):
+            if path == self.root:
+                raise OSError("root inspection failed")
+            return fetch_stat(path, **kwargs)
+
+        with patch.object(Path, "stat", inspect_root):
+            with self.assertRaisesRegex(OSError, "root inspection failed"):
                 search_quicknotes(self.root, "word")
+
+    def test_cloud_file_and_directory_are_read_without_output_validation(self):
+        path = self.write("cloud/managed.md", b"word")
+        lstat = Path.lstat
+
+        def cloud_stat(candidate):
+            info = lstat(candidate)
+            if candidate in (path, path.parent):
+                values = {name: getattr(info, name) for name in
+                          ("st_mode", "st_ino", "st_dev", "st_size", "st_ctime_ns", "st_mtime_ns")}
+                return SimpleNamespace(**values, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                                       st_reparse_tag=0x9000301A)
+            return info
+
+        with patch.object(Path, "lstat", cloud_stat), patch(
+                "mdh_db.aggregate_output.OutputDirectory", side_effect=AssertionError("output validation")):
+            result = search_quicknotes(self.root, "word")
+        self.assertFalse(result["incomplete"])
+        self.assertEqual([hit["path"] for hit in result["hits"]], ["cloud/managed.md"])
+        self.assertEqual(result["diagnostics"], [])
+        self.assertEqual(path.read_bytes(), b"word")
 
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
     def test_junction_root_is_allowed_and_child_escape_and_cycle_are_skipped(self):

@@ -39,6 +39,12 @@ function Invoke-MdhAggregate {
             "--aggregate-root=$($script:MDH_CONFIG.paths.aggregate)"
             "--cwd=$WorkingDirectory"
         ) + $Arguments
+        if ($script:MDH_CONFIG.paths.quicknotes) {
+            $argumentsToSend += "--quicknotes-root=$($script:MDH_CONFIG.paths.quicknotes)"
+        }
+        if ($script:MDH_CONFIG.todo) {
+            $argumentsToSend += "--todo-file=$(Get-MdhTodoPath)"
+        }
         $result = Invoke-MdhDbProcess -Python $python -Module $module -Operation $Operation -Arguments $argumentsToSend
     }
     catch {

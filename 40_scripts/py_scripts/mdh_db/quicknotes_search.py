@@ -6,22 +6,35 @@ import os
 from pathlib import Path
 import stat
 
-from .aggregate import AggregateError
-from .aggregate_output import OutputDirectory, _identity, _inspect
 from .parser import EOL, ParseError, _read_source
 from .search import ASCII_LOWER, matches_in_span, query_terms
 
 
+def _inspect(path):
+    info = path.lstat()
+    tag = getattr(info, "st_reparse_tag", None)
+    # The Cloud Files tags describe managed content, not a redirected name.
+    cloud = tag is not None and tag & ~0xF000 == 0x9000001A
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return info, stat.S_ISLNK(info.st_mode) or bool(reparse and not cloud)
+
+
+def _same_identity(first, second):
+    return not (first.st_ino and second.st_ino) or (
+        first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
 def _verify_directories(chain):
-    for directory, identity in chain:
-        info, linked = _inspect(directory)
-        if linked or not stat.S_ISDIR(info.st_mode) or _identity(info, directory) != identity:
+    for index, (directory, expected) in enumerate(chain):
+        info, linked = _inspect(directory) if index else (directory.stat(), False)
+        if linked or not stat.S_ISDIR(info.st_mode) or not _same_identity(info, expected):
             raise OSError("Directory changed during search")
 
 
-def _revision(info, path):
+def _same_revision(first, second):
     # Windows stat and fstat may expose different semantics for ctime.
-    return _identity(info, path), info.st_size, info.st_mtime_ns
+    return (_same_identity(first, second) and first.st_size == second.st_size
+            and first.st_mtime_ns == second.st_mtime_ns)
 
 
 def _snapshot(path, expected, chain):
@@ -31,19 +44,19 @@ def _snapshot(path, expected, chain):
     flags |= getattr(os, "O_NONBLOCK", 0)
     with os.fdopen(os.open(path, flags), "rb") as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or _revision(before, path) != _revision(expected, path):
+        if not stat.S_ISREG(before.st_mode) or not _same_revision(before, expected):
             raise OSError("File changed before reading")
         _verify_directories(chain)
         current, linked = _inspect(path)
-        if linked or _revision(current, path) != _revision(before, path) or current.st_ctime_ns != expected.st_ctime_ns:
+        if linked or not _same_revision(current, before) or current.st_ctime_ns != expected.st_ctime_ns:
             raise OSError("File changed before reading")
         raw = stream.read()
         after = os.fstat(stream.fileno())
-        if _revision(after, path) != _revision(before, path) or after.st_ctime_ns != before.st_ctime_ns:
+        if not _same_revision(after, before) or after.st_ctime_ns != before.st_ctime_ns:
             raise OSError("File changed during reading")
     _verify_directories(chain)
     current, linked = _inspect(path)
-    if linked or _revision(current, path) != _revision(before, path) or current.st_ctime_ns != expected.st_ctime_ns:
+    if linked or not _same_revision(current, before) or current.st_ctime_ns != expected.st_ctime_ns:
         raise OSError("File changed during reading")
     return raw
 
@@ -51,19 +64,17 @@ def _snapshot(path, expected, chain):
 def search_quicknotes(root: Path, query: str) -> dict:
     terms = query_terms(query)
     needles = tuple(term.translate(ASCII_LOWER) for term in terms)
-    logical = OutputDirectory(root, root)
-    physical = OutputDirectory(logical.physical, allow_volume=True)
-    if physical.physical not in physical.observed:
-        raise FileNotFoundError("QuickNotes root does not exist")
-    logical.check()
-    chain = tuple((p, identity) for p, (identity, _) in physical.observed.items())
-    pending = [(physical.physical, chain)]
+    root_info = root.stat()
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise NotADirectoryError(root)
+    root_chain = ((root, root_info),)
+    pending = [(root, root_chain)]
     hits, diagnostics = [], []
     scanned = matching_lines = 0
     incomplete = False
 
     def note(code, path, message):
-        diagnostics.append({"code": code, "path": path.relative_to(physical.physical).as_posix(),
+        diagnostics.append({"code": code, "path": path.relative_to(root).as_posix(),
                             "message": str(message)})
 
     while pending:
@@ -73,8 +84,8 @@ def search_quicknotes(root: Path, query: str) -> dict:
             with os.scandir(directory) as children:
                 paths = sorted(Path(child.path) for child in children)
             _verify_directories(chain)
-        except (OSError, AggregateError) as error:
-            if directory == physical.physical:
+        except OSError as error:
+            if directory == root:
                 raise
             note("DIRECTORY_READ_FAILED", directory, error)
             incomplete = True
@@ -84,10 +95,13 @@ def search_quicknotes(root: Path, query: str) -> dict:
                 _verify_directories(chain)
                 info, linked = _inspect(path)
                 if linked:
-                    note("SKIPPED_REPARSE_POINT", path, "Symbolic links and reparse points are not followed")
+                    note("SKIPPED_REPARSE_POINT", path, "Links and unsupported reparse points are not followed")
                     continue
                 if stat.S_ISDIR(info.st_mode):
-                    pending.append((path, (*chain, (path, _identity(info, path)))))
+                    if info.st_ino and any(_same_identity(info, ancestor) for _, ancestor in chain if ancestor.st_ino):
+                        note("SKIPPED_REPARSE_POINT", path, "Directory cycle is not followed")
+                        continue
+                    pending.append((path, (*chain, (path, info))))
                     continue
                 if path.suffix.lower() != ".md":
                     continue
@@ -96,7 +110,7 @@ def search_quicknotes(root: Path, query: str) -> dict:
                     continue
                 raw = _snapshot(path, info, chain)
                 source = _read_source(raw)
-            except (OSError, AggregateError, ParseError) as error:
+            except (OSError, ParseError) as error:
                 note("FILE_READ_FAILED", path, error)
                 incomplete = True
                 continue
@@ -110,13 +124,12 @@ def search_quicknotes(root: Path, query: str) -> dict:
                        matches_in_span(source.text, term, 0, 1, 1, folded=folded)]
             numbers = sorted({match.line for match in matches})
             source_lines = EOL.split(source.text)
-            name = path.relative_to(physical.physical).as_posix()
+            name = path.relative_to(root).as_posix()
             hits.append({"source": "QuickNotes", "path": name, "kind": "file", "title": name,
                          "snapshot_hash": sha256(raw).hexdigest(), "matches": [asdict(match) for match in matches],
                          "lines": [{"line": n, "text": source_lines[n - 1]} for n in numbers]})
             matching_lines += len(numbers)
-    logical.check()
-    physical.check()
+    _verify_directories(root_chain)
     hits.sort(key=lambda hit: (hit["path"].casefold(), hit["path"]))
     diagnostics.sort(key=lambda item: (item["path"].casefold(), item["path"], item["code"]))
     return {"hits": hits, "files_scanned": scanned, "files_matched": len(hits),

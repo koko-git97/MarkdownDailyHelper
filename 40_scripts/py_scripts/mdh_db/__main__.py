@@ -81,12 +81,11 @@ def _diagnostic(code, message, **details):
 
 def _execute(args):
     if args.operation == "quicknotes":
-        from .aggregate import AggregateError
         from .quicknotes_search import search_quicknotes
 
         try:
             return 0, search_quicknotes(args.root, args.query), []
-        except (OSError, AggregateError) as error:
+        except OSError as error:
             return 4, None, [_diagnostic("QUICKNOTES_ROOT", error)]
         except ValueError as error:
             return 2, None, [_diagnostic("INVALID_INPUT", error)]

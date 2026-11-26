@@ -22,6 +22,8 @@ def _arguments(argv):
         command = commands.add_parser(operation, add_help=False)
         for key in ("config", "daily-root", "aggregate-root", "cwd"):
             command.add_argument(f"--{key}", type=_absolute, required=True)
+        for key in ("quicknotes-root", "todo-file"):
+            command.add_argument(f"--{key}", type=_absolute)
         if operation == "reverse":
             command.add_argument("--concept", required=True)
             command.add_argument("--type")
@@ -56,14 +58,19 @@ def _target(path, args, root, *, export=False):
     target = safe_path(candidate, allow_volume=True)
 
     def check_protection():
-        daily = args.daily_root
         config = args.config
         template = config.with_name("config.template.json")
+        protected_roots = [args.daily_root]
+        if args.quicknotes_root is not None:
+            protected_roots.append(args.quicknotes_root)
+        protected_files = [config, template]
+        if args.todo_file is not None:
+            protected_files.append(args.todo_file)
         aggregate = _resolve(args.aggregate_root) if export else root.physical
-        if (path.is_relative_to(daily) or path in (config, template)
+        if (any(path.is_relative_to(protected) for protected in protected_roots) or path in protected_files
                 or path.is_relative_to(args.aggregate_root) == export
-                or _physically_within(target, _resolve(daily))
-                or any(_location(target) == _location(_resolve(settings)) for settings in (config, template))
+                or any(_physically_within(target, _resolve(protected)) for protected in protected_roots)
+                or any(_location(target) == _location(_resolve(protected)) for protected in protected_files)
                 or _physically_within(target, aggregate) == export):
             raise AggregateError(f"Protected output path: {path} -> {target}; "
                                  f"aggregate root: {aggregate}; choose an unprotected destination")

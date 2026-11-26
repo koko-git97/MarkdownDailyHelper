@@ -487,7 +487,9 @@ class AggregateTests(unittest.TestCase):
         self.assertFalse(_physically_within(root / "elsewhere" / "file.md", self.root / "missing"))
         info = SimpleNamespace(st_reparse_tag=stat.IO_REPARSE_TAG_MOUNT_POINT,
                                st_file_attributes=stat.FILE_ATTRIBUTE_DIRECTORY)
-        for invalid in (Path(root.anchor), root.anchor.rstrip("\\"), r"\\?\Volume{bad}\folder",
+        with patch("mdh_db.aggregate_output.os.readlink", return_value=root.anchor):
+            self.assertEqual(_junction_destination(self.root / "link", info), Path(root.anchor))
+        for invalid in (root.anchor.rstrip("\\"), r"\\?\Volume{bad}\folder",
                         r"\\?\UNC\server\share\folder", r"\\?\GLOBALROOT\Device\folder", r"C:relative"):
             with self.subTest(destination=invalid), patch("mdh_db.aggregate_output.os.readlink", return_value=str(invalid)):
                 with self.assertRaises(AggregateError):
@@ -694,8 +696,8 @@ class AggregateTests(unittest.TestCase):
         self.assertEqual(list(old.iterdir()), [old / "Alpha.md"])
         self.assertFalse(list(new.iterdir()))
 
-    @unittest.skipUnless(os.name == "nt", "requires Windows mutexes and volume paths")
-    def test_mutex_blocks_a_separate_process_using_guid_spelling(self):
+    @unittest.skipUnless(os.name == "nt", "requires Windows mutexes")
+    def test_mutex_blocks_a_separate_process_for_same_output_path(self):
         script = """
 import ctypes
 from ctypes import wintypes
@@ -729,9 +731,6 @@ with _writer(Path(sys.argv[2])):
 """
         package = str(Path(__file__).resolve().parents[3] / "40_scripts" / "py_scripts")
         dos = self.root / "lock.md"
-        guid = volume_alias(dos)
-        other = self.root / "other"
-        other.mkdir()
 
         def command(path, marker):
             return [sys.executable, "-B", "-c", script, package, str(path), str(marker)]
@@ -743,69 +742,33 @@ with _writer(Path(sys.argv[2])):
             self.assertEqual(result.stdout.strip(), "locked")
             self.assertFalse(marker.exists())
 
-        assert_uncontended(guid, "control")
-        legacy_key = sha256(str(dos).upper().encode("utf-8")).hexdigest()
-        for label, parent, path in (("physical", _writer(dos), guid),
-                                    ("legacy", output._windows_mutex(legacy_key, dos), dos)):
-            with self.subTest(mutex=label):
-                marker = self.root / label
-                child = None
-                try:
-                    with parent:
-                        if label == "physical":
-                            assert_uncontended(self.root / "different.md", "different-name")
-                            assert_uncontended(other / dos.name, "different-parent")
-                        child = subprocess.Popen(command(path, marker), stdout=subprocess.PIPE,
-                                                 stderr=subprocess.PIPE, text=True)
-                        deadline = time.monotonic() + 8
-                        while not marker.exists():
-                            if child.poll() is not None:
-                                stdout, stderr = child.communicate(timeout=2)
-                                self.fail(f"Child exited before contention ({child.returncode}): {stdout}{stderr}")
-                            if time.monotonic() >= deadline:
-                                child.kill()
-                                stdout, stderr = child.communicate(timeout=5)
-                                self.fail(f"Child did not report kernel contention: {stdout}{stderr}")
-                            time.sleep(0.01)
-                        self.assertIsNone(child.poll())
-                    stdout, stderr = child.communicate(timeout=8)
-                    self.assertEqual(child.returncode, 0, stderr)
-                    self.assertEqual(stdout.strip(), "locked")
-                finally:
-                    if child is not None:
-                        if child.poll() is None:
-                            child.kill()
-                        child.communicate(timeout=5)
-
-    @unittest.skipUnless(os.name == "nt", "requires Windows mutex ordering")
-    def test_mutex_order_and_first_release_if_second_fails(self):
-        path = self.root / "lock.md"
-        device, inode = _location(self.root)[0]
-        physical = sha256(f"physical:{device}:{inode}:{path.name.upper()}".encode("utf-8")).hexdigest()
-        legacy = sha256(str(path).upper().encode("utf-8")).hexdigest()
-        events = []
-
-        @contextmanager
-        def traced_mutex(key, target):
-            events.append(("acquire", key))
-            if fail_second and key == legacy:
-                raise AggregateError("second lock failed")
-            try:
-                yield
-            finally:
-                events.append(("release", key))
-
-        with patch.object(output, "_windows_mutex", traced_mutex):
-            fail_second = False
-            with _writer(path):
-                events.append(("body", None))
-            self.assertEqual(events, [("acquire", physical), ("acquire", legacy), ("body", None),
-                                      ("release", legacy), ("release", physical)])
-            events.clear()
-            fail_second = True
-            with self.assertRaisesRegex(AggregateError, "second lock failed"), _writer(path):
-                self.fail("writer entered after second mutex failed")
-        self.assertEqual(events, [("acquire", physical), ("acquire", legacy), ("release", physical)])
+        assert_uncontended(dos, "control")
+        key = sha256(str(dos).upper().encode("utf-8")).hexdigest()
+        marker = self.root / "waited"
+        child = None
+        try:
+            with output._windows_mutex(key, dos):
+                child = subprocess.Popen(command(dos, marker), stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic() + 8
+                while not marker.exists():
+                    if child.poll() is not None:
+                        stdout, stderr = child.communicate(timeout=2)
+                        self.fail(f"Child exited before contention ({child.returncode}): {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        child.kill()
+                        stdout, stderr = child.communicate(timeout=5)
+                        self.fail(f"Child did not report kernel contention: {stdout}{stderr}")
+                    time.sleep(0.01)
+                self.assertIsNone(child.poll())
+            stdout, stderr = child.communicate(timeout=8)
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "locked")
+        finally:
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=5)
 
     def test_export_refuses_a_symbolic_link(self):
         self.write_daily("2026-11-23", "## Alpha\nbody\n")
@@ -822,7 +785,7 @@ with _writer(Path(sys.argv[2])):
         self.assertFalse(list(actual.iterdir()))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
-    def test_junction_root_ancestor_index_export_and_physical_lock(self):
+    def test_junction_root_ancestor_index_export_and_path_lock(self):
         daily = self.write_daily("2026-11-23", "## Alpha\nbody\n")
         self.set_concepts({"Alpha": {}})
         actual = self.root / "物理 ルート"
@@ -1001,7 +964,7 @@ with _writer(Path(sys.argv[2])):
         self.assertFalse(path.exists())
         self.assertEqual(next(directory.glob(".mdh-*.tmp")).read_bytes(), b"unrelated")
 
-    def test_reverse_rejects_existing_output_without_identity(self):
+    def test_reverse_updates_owned_output_without_identity(self):
         self.set_concepts({"Alpha": {}})
         self.write_daily("2026-11-23", "## Alpha\noriginal\n")
         args = ("reverse", "--concept=Alpha")
@@ -1010,19 +973,83 @@ with _writer(Path(sys.argv[2])):
         original = path.read_bytes()
         self.write_daily("2026-11-23", "## Alpha\nchanged\n")
         inspect = output._inspect
+        fstat = os.fstat
+
+        def without_inode(info):
+            return os.stat_result((*info[:1], 0, *info[2:]))
 
         def inspect_without_inode(candidate):
             info, linked = inspect(candidate)
-            if candidate == path:
-                info = os.stat_result((*info[:1], 0, *info[2:]))
+            if candidate == path or candidate.suffix == ".tmp":
+                info = without_inode(info)
             return info, linked
 
-        with patch.object(output, "_inspect", side_effect=inspect_without_inode):
+        with patch.object(output, "_inspect", side_effect=inspect_without_inode), \
+                patch.object(os, "fstat", side_effect=lambda fd: without_inode(fstat(fd))):
             code, _, issues = self.command(*args)
-        self.assertEqual(code, 4)
-        self.assertIn("Cannot identify", issues[0]["message"])
-        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual((code, issues), (0, []))
+        self.assertNotEqual(path.read_bytes(), original)
+        self.assertIn(b"changed", path.read_bytes())
         self.assertEqual(list(self.aggregate.iterdir()), [path])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows drive APIs")
+    def test_remote_drive_classification_does_not_block_aggregation(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.set_concepts({"Alpha": {}})
+        self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_attributes = kernel.GetFileAttributesW
+        get_attributes.argtypes = (wintypes.LPCWSTR,)
+        get_attributes.restype = wintypes.DWORD
+
+        def attributes(name):
+            # Network providers can reject attribute queries on the volume root.
+            self.assertNotEqual(Path(name), Path(name).parent)
+            return get_attributes(name)
+
+        kernel.GetFileAttributesW = Mock(side_effect=attributes)
+        remote = Mock(return_value=4)
+        kernel.GetDriveTypeW = remote
+        output._windows_attributes.cache_clear()
+        self.addCleanup(output._windows_attributes.cache_clear)
+        with patch.object(ctypes, "WinDLL", return_value=kernel):
+            self.assertEqual(self.command("run")[0], 0)
+        remote.assert_not_called()
+        self.assertTrue((self.aggregate / "Alpha.md").is_file())
+        self.assertTrue((self.aggregate / "index.md").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows UNC paths")
+    def test_mapped_drive_can_resolve_to_an_internal_unc_path(self):
+        mapped = Path(r"Z:\Reports")
+        with patch.object(Path, "resolve", return_value=Path(r"\\?\UNC\server\share\Reports")):
+            resolved = _resolve(mapped)
+        self.assertEqual(resolved, Path(r"\\server\share\Reports"))
+        _check_spelling(resolved, allow_unc=True)
+        with self.assertRaises(AggregateError):
+            _check_spelling(resolved)
+        with self.assertRaises(AggregateError):
+            _check_spelling(Path(r"\\.\C:\Reports"), allow_unc=True)
+
+    def test_quicknotes_and_configured_todo_are_protected_even_with_generated_metadata(self):
+        self.write_daily("2026-11-23", "## Alpha\nfixture\n")
+        notes = self.root / "Notes"
+        notes.mkdir()
+        todo = self.root / "custom-todo.md"
+        original = generated_bytes("original\n", "export", "Alpha")
+        targets = [notes / "note.md", todo]
+        if os.name == "nt":
+            alias = self.root / "Notes alias"
+            self.junction(alias, notes)
+            targets.append(alias / "note.md")
+        for target in targets:
+            target.write_bytes(original)
+            code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={target}",
+                                           f"--quicknotes-root={notes}", f"--todo-file={todo}")
+            self.assertEqual(code, 4)
+            self.assertIn("Protected output path", issues[0]["message"])
+            self.assertEqual(target.read_bytes(), original)
 
     def test_reverse_keeps_replacement_when_temporary_inode_is_unavailable(self):
         self.set_concepts({"Alpha": {}})
@@ -1062,14 +1089,15 @@ with _writer(Path(sys.argv[2])):
                         output.os, "fstat", side_effect=lambda fd: zero_inode(fstat(fd)) if issue_at_creation else fstat(fd)):
                     if issue_at_creation:
                         with patch.object(output.os, "fsync", side_effect=OSError("injected write interruption")):
-                            code, _, issues = self.command(*args)
-                        self.assertEqual(code, 4)
-                        self.assertIn("Temporary output retained", issues[0]["message"])
+                            with self.assertLogs(output.__name__, level="WARNING") as logs:
+                                code, _, issues = self.command(*args)
+                        self.assertIn("injected write interruption", issues[0]["message"])
+                        self.assertIn("Temporary output retained", logs.output[0])
                     else:
                         with self.assertLogs(output.__name__, level="WARNING") as logs:
                             code, _, issues = self.command(*args)
                         self.assertIn("Temporary output retained", logs.output[0])
-                        self.assertIn("Cannot identify", issues[0]["message"])
+                        self.assertIn("Output changed", issues[0]["message"])
                 self.assertEqual(code, 4)
                 self.assertEqual(path.read_bytes(), original)
                 self.assertEqual(temporary.read_bytes(), b"unrelated replacement")
@@ -1077,7 +1105,7 @@ with _writer(Path(sys.argv[2])):
                 temporary.unlink()
                 (self.aggregate / "displaced.tmp").unlink()
 
-    def test_reverse_does_not_skip_unidentifiable_existing_ancestor(self):
+    def test_reverse_creates_output_with_unidentifiable_existing_ancestor(self):
         self.write_daily("2026-11-23", "## Alpha\nfixture\n")
         ancestor = self.root / "existing"
         ancestor.mkdir()
@@ -1092,10 +1120,8 @@ with _writer(Path(sys.argv[2])):
 
         with patch.object(output, "_inspect", side_effect=inspect_without_inode):
             code, _, issues = self.command("reverse", "--concept=Alpha", f"--output={path}")
-        self.assertEqual(code, 4)
-        self.assertIn("Cannot identify", issues[0]["message"])
-        self.assertIn(str(ancestor), issues[0]["message"])
-        self.assertFalse(list(ancestor.iterdir()))
+        self.assertEqual((code, issues), (0, []))
+        self.assertIn(b"fixture", path.read_bytes())
 
     def test_hard_link_and_temporary_write_failure_preserve_original(self):
         path = self.root / "report.md"

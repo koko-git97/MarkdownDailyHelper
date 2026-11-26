@@ -10,6 +10,7 @@ Describe 'mdreverse and mdrun from the production loader' {
         $configuration = Join-Path $settings 'config.json'
         @{
             paths = @{ MDH_root = '' }
+            todo = @{ file = 'custom-todo.md' }
             db = @{ python = $env:MDH_TEST_PYTHON_EXECUTABLE; store_dir = 'unused SQLite' }
             concepts = @{ '既存' = @{ keywords = @('sample'); category = '開発' } }
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configuration -Encoding utf8
@@ -41,6 +42,13 @@ Describe 'mdreverse and mdrun from the production loader' {
             $LASTEXITCODE | Should Be 0
             $export = Join-Path $root 'report.md'
             [IO.File]::ReadAllText($export) | Should Match '"kind":"export"'
+            $originalExport = [IO.File]::ReadAllText($export)
+            foreach ($protectedPath in '00_QuickNotes/protected.md', 'custom-todo.md') {
+                [IO.File]::WriteAllText((Join-Path $root $protectedPath), $originalExport)
+                mdreverse sample -Type Meeting -OutputPath $protectedPath -ErrorAction SilentlyContinue
+                $LASTEXITCODE | Should Be 4
+                [IO.File]::ReadAllText((Join-Path $root $protectedPath)) | Should Be $originalExport
+            }
             mdreverse sample -Type Review -OutputPath './report.md'
             $LASTEXITCODE | Should Be 0
             [IO.File]::ReadAllText($export) | Should Match '"type":"Meeting"'

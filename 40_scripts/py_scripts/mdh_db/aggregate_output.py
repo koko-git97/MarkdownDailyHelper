@@ -20,6 +20,7 @@ _LOGGER = logging.getLogger(__name__)
 _HEADER = re.compile(r"\A<!-- MDH:GENERATED\r?\n([^\r\n]+)\r?\n-->\r?\n")
 _EXTENDED = "\\\\?\\"
 _VOLUME_NAME = re.compile(r"Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}", re.I | re.ASCII)
+_UNC_SHARE = re.compile(r"\\\\[^\\/:*?\"<>|.][^\\/:*?\"<>|]*\\[^\\/:*?\"<>|]+")
 
 
 def generated_bytes(body: str, kind: str, concept: str | None = None, type_filter: str | None = None) -> bytes:
@@ -55,9 +56,14 @@ def _volume_path(path: Path) -> bool:
             and path.anchor == path.drive + "\\")
 
 
-def _check_spelling(path: Path, *, allow_volume=False) -> None:
+def _unc_path(path: Path) -> bool:
+    return os.name == "nt" and _UNC_SHARE.fullmatch(path.drive) is not None
+
+
+def _check_spelling(path: Path, *, allow_volume=False, allow_unc=False) -> None:
     if (not path.is_absolute() or ".." in path.parts
-            or (str(path).startswith("\\\\") and not (allow_volume and _volume_path(path)))):
+            or (str(path).startswith("\\\\") and not (
+                (allow_volume and _volume_path(path)) or (allow_unc and _unc_path(path))))):
         raise AggregateError(f"Unsafe output path: {path}")
     for part in path.parts[1:]:
         if (part.endswith((".", " ")) or any(ord(ch) < 32 or ch in ':*?"<>|' for ch in part)
@@ -77,14 +83,15 @@ def _windows_attributes():
     get_attributes = ctypes.WinDLL("kernel32", use_last_error=True).GetFileAttributesW
     get_attributes.argtypes = (wintypes.LPCWSTR,)
     get_attributes.restype = wintypes.DWORD
-    get_drive_type = ctypes.WinDLL("kernel32", use_last_error=True).GetDriveTypeW
-    get_drive_type.argtypes = (wintypes.LPCWSTR,)
-    get_drive_type.restype = wintypes.UINT
 
     def attributes(path):
-        if path == Path(path.anchor) and get_drive_type(path.anchor) not in (2, 3, 5, 6):
-            raise AggregateError(f"Unsafe output path drive: {path}; use a local drive")
-        result = get_attributes(str(path) if _volume_path(path) else _EXTENDED + str(path))
+        # GetFileAttributesW cannot query a share root. lstat also checks drive roots.
+        if path == Path(path.anchor):
+            return 0
+        name = str(path)
+        if len(name.encode("utf-16-le")) // 2 >= 260 and not _volume_path(path):
+            name = _EXTENDED + ("UNC\\" + name[2:] if _unc_path(path) else name)
+        result = get_attributes(name)
         if result == 0xFFFFFFFF:
             error = ctypes.get_last_error()
             if error in (2, 3):
@@ -113,6 +120,10 @@ def _identity(info, path):
     return info.st_dev, info.st_ino
 
 
+def _optional_identity(info):
+    return (info.st_dev, info.st_ino) if info.st_ino else None
+
+
 def _junction_destination(path, info):
     tag = getattr(info, "st_reparse_tag", None)
     if (os.name == "nt" and tag == stat.IO_REPARSE_TAG_MOUNT_POINT
@@ -124,17 +135,16 @@ def _junction_destination(path, info):
             if destination.is_absolute() and re.fullmatch(r"[A-Za-z]:", destination.drive):
                 return destination
             volume = Path(substitution)
-            if (_volume_path(volume) and len(volume.parts) > 1
-                    and substitution.startswith(volume.anchor) and "/" not in substitution):
+            if _volume_path(volume) and substitution.startswith(volume.anchor) and "/" not in substitution:
                 return volume
         raise AggregateError(f"Unsafe output path junction: {path} -> {substitution}; use a local directory")
     raise AggregateError(f"Unsafe output path component: {path}; unsupported reparse point "
                          f"(tag: {tag!r}); use a local directory or directory junction")
 
 
-def _directories(path, junction_root, seen=frozenset(), *, allow_volume=False):
+def _directories(path, junction_root, seen=frozenset(), *, allow_volume=False, allow_unc=False):
     """Walk existing directories one component at a time, before following each junction."""
-    _check_spelling(path, allow_volume=allow_volume)
+    _check_spelling(path, allow_volume=allow_volume, allow_unc=allow_unc)
     physical = Path(path.anchor)
     observed = {}
     for logical, part in zip((*reversed(path.parents), path), ("", *path.parts[1:])):
@@ -150,30 +160,30 @@ def _directories(path, junction_root, seen=frozenset(), *, allow_volume=False):
                 raise AggregateError(f"Unsafe output path component: {logical} ({physical}); "
                                      f"junctions are allowed only at or above {junction_root}")
             link = physical
-            identity = _identity(info, link)
-            if identity in seen or len(seen) >= 63:
+            if link in seen or len(seen) >= 63:
                 raise AggregateError(f"Unsafe output path: circular or excessive junction chain at {link}")
             destination = _junction_destination(link, info)
-            physical, chain = _directories(destination, destination, seen | {identity}, allow_volume=True)
+            physical, chain = _directories(destination, destination, seen | {link}, allow_volume=True)
             if physical not in chain:
                 raise AggregateError(f"Unsafe output path junction: {link} -> {destination}; destination is missing")
             observed.update(chain)
-            observed[link] = (identity, destination)
+            observed[link] = (_optional_identity(info), destination)
         elif stat.S_ISDIR(info.st_mode):
-            observed[physical] = (_identity(info, physical), None)
+            observed[physical] = (_optional_identity(info), None)
         else:
             raise AggregateError(f"Unsafe output path component: {physical}")
     return physical, observed
 
 
-def _file_identity(path):
+def _file_revision(path):
     try:
         info, linked = _inspect(path)
     except FileNotFoundError:
         return None
     if linked or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise AggregateError(f"Output is not a single regular file: {path}")
-    return _identity(info, path)
+    # An existing file with no inode must still be distinguishable from absence.
+    return (_optional_identity(info), info.st_size, info.st_mtime_ns)
 
 
 def _canonical_volume_path(path):
@@ -217,13 +227,24 @@ def _canonical_volume_path(path):
 
 def _resolve(path):
     try:
-        resolved = _canonical_volume_path(path) if _volume_path(path) else path.resolve()
+        if _volume_path(path):
+            resolved = _canonical_volume_path(path)
+        else:
+            for ancestor in (path, *path.parents):
+                try:
+                    resolved = ancestor.resolve(strict=True) / path.relative_to(ancestor)
+                    break
+                except FileNotFoundError:
+                    if ancestor == Path(path.anchor):
+                        raise
     except RuntimeError as error:
         raise AggregateError(f"Unsafe output path: {path}: {error}") from error
     if os.name == "nt":
         # pathlib can retain the extended prefix when its input uses a GUID.
         if resolved.drive.startswith(_EXTENDED) and re.fullmatch(r"[A-Za-z]:", resolved.drive[len(_EXTENDED):]):
             return Path(str(resolved)[len(_EXTENDED):])
+        if str(resolved).upper().startswith(_EXTENDED + "UNC\\"):
+            return Path("\\\\" + str(resolved)[8:])
     return resolved
 
 
@@ -234,7 +255,8 @@ def _location(path):
             info = ancestor.stat()
         except FileNotFoundError:
             continue
-        return _identity(info, ancestor), tuple(os.path.normcase(part) for part in path.relative_to(ancestor).parts)
+        return _optional_identity(info) or ancestor, tuple(
+            os.path.normcase(part) for part in path.relative_to(ancestor).parts)
     raise AggregateError(f"Cannot identify output location: {path}")
 
 
@@ -245,16 +267,8 @@ def _physically_within(path, root):
     return any(_location(ancestor) == location for ancestor in (path, *path.parents))
 
 
-def _observed_location(path, observed):
-    for ancestor in (path, *path.parents):
-        info = observed.get(ancestor)
-        if info is not None and info[1] is None:
-            return info[0], tuple(os.path.normcase(part) for part in path.relative_to(ancestor).parts)
-    raise AggregateError(f"Cannot identify output directory: {path}")
-
-
 class OutputDirectory:
-    """Pin a physical directory and the existing components used to reach it."""
+    """Resolve the save directory and track observed components."""
 
     def __init__(self, logical, junction_root=None, *, allow_volume=False):
         self.logical = logical
@@ -263,13 +277,13 @@ class OutputDirectory:
         self.physical, self.observed = self._scan()
 
     def _scan(self):
-        path, observed = _directories(self.logical, self.junction_root, allow_volume=self.allow_volume)
+        path, observed = _directories(self.logical, self.junction_root, allow_volume=self.allow_volume,
+                                      allow_unc=self.allow_volume)
         canonical = _resolve(path)
         # Windows resolves aliases such as short names and substituted drives here.
-        canonical, physical = _directories(canonical, None, allow_volume=True)
-        if _observed_location(path, observed) != _observed_location(canonical, physical):
-            raise AggregateError(f"Output directory changed: {self.logical} -> {canonical}")
-        observed.update(physical)
+        if canonical != path:
+            canonical, physical = _directories(canonical, None, allow_volume=True, allow_unc=True)
+            observed.update(physical)
         return canonical, observed
 
     def check(self, *, bind=False):
@@ -284,12 +298,12 @@ class OutputDirectory:
 
 def safe_path(path: Path, *, allow_volume=False) -> Path:
     """Reject links/reparse points and unsafe Windows path components before writes."""
-    _check_spelling(path, allow_volume=allow_volume)
+    _check_spelling(path, allow_volume=allow_volume, allow_unc=allow_volume)
     parent = OutputDirectory(path.parent, allow_volume=allow_volume)
-    original = _file_identity(path)
+    original = _file_revision(path)
     physical = _resolve(parent.physical / path.name)
-    _check_spelling(physical, allow_volume=allow_volume)
-    if _file_identity(physical) != original:
+    _check_spelling(physical, allow_volume=allow_volume, allow_unc=allow_volume)
+    if _file_revision(physical) != original:
         raise AggregateError(f"Output path changed: {path}")
     return physical
 
@@ -307,12 +321,8 @@ def _writer(path: Path):
             os.close(descriptor)
         return
 
-    (device, inode), suffix = _location(path.parent)
-    if suffix:
-        raise AggregateError(f"Output directory disappeared before locking: {path.parent}")
-    legacy_key = sha256(str(path).upper().encode("utf-8")).hexdigest()
-    physical_key = sha256(f"physical:{device}:{inode}:{path.name.upper()}".encode("utf-8")).hexdigest()
-    with _windows_mutex(physical_key, path), _windows_mutex(legacy_key, path):
+    key = sha256(str(path).upper().encode("utf-8")).hexdigest()
+    with _windows_mutex(key, path):
         yield
 
 
@@ -375,15 +385,17 @@ def publish(path: Path, content: bytes, *, expected=_GENERATED, validate=None) -
     check()
     with _writer(path):
         check()
-        original_identity = _file_identity(path)
+        original_revision = _file_revision(path)
         original = _read_existing(path)
         if expected is _GENERATED:
             if original is not None:
                 assert_owner(original, content)
         elif expected is None or expected != original:
             raise AggregateError(f"Configuration changed before saving: {path}")
+        elif original_revision is None or original_revision[0] is None:
+            raise AggregateError(f"Cannot identify configuration file: {path}")
         check()
-        if _file_identity(path) != original_identity:
+        if _file_revision(path) != original_revision:
             raise AggregateError(f"Output changed before saving: {path}")
         if original == content:
             return False
@@ -393,15 +405,20 @@ def publish(path: Path, content: bytes, *, expected=_GENERATED, validate=None) -
             with NamedTemporaryFile(dir=path.parent, prefix=".mdh-", suffix=".tmp", delete=False) as handle:
                 temporary = Path(handle.name)
                 try:
-                    temporary_identity = _identity(os.fstat(handle.fileno()), temporary)
-                except (OSError, AggregateError) as error:
-                    raise AggregateError(f"Temporary output retained at {temporary}: {error}") from error
+                    temporary_identity = _optional_identity(os.fstat(handle.fileno()))
+                except OSError:
+                    if expected is not _GENERATED:
+                        raise
+                if expected is not _GENERATED and temporary_identity is None:
+                    raise AggregateError(f"Cannot identify temporary configuration file: {temporary}")
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
             check()
-            if (_file_identity(path) != original_identity or _read_existing(path) != original
-                    or _file_identity(temporary) != temporary_identity):
+            current = _file_revision(temporary)
+            if (current is None or (current[0] and temporary_identity and current[0] != temporary_identity)
+                    or current[1] != len(content) or temporary.read_bytes() != content
+                    or _file_revision(path) != original_revision or _read_existing(path) != original):
                 raise AggregateError(f"Output changed before saving: {path}")
             if original is None:
                 if os.name == "nt":
@@ -412,11 +429,12 @@ def publish(path: Path, content: bytes, *, expected=_GENERATED, validate=None) -
                 os.replace(temporary, path)
             return True
         finally:
-            if temporary is not None and temporary_identity is not None:
+            if temporary is not None:
                 try:
                     directory.check()
                     info, linked = _inspect(temporary)
-                    if linked or not stat.S_ISREG(info.st_mode) or _identity(info, temporary) != temporary_identity:
+                    if (linked or not stat.S_ISREG(info.st_mode)
+                            or _identity(info, temporary) != temporary_identity):
                         raise AggregateError(f"Temporary output changed: {temporary}")
                     temporary.unlink(missing_ok=True)
                 except FileNotFoundError:

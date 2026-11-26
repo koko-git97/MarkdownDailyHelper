@@ -153,11 +153,11 @@ README や設定テンプレートに関連記述があっても、以下のコ�
 
 ### Windowsのjunctionを使った集約
 
-通常の `mdreverse` と `mdrun` では、ローカルディレクトリを指すjunctionを集約ルートまたはその祖先に使えます。ドライブ文字形式に加え、参照先がVolume GUID形式のローカルディレクトリを指すjunctionも利用できる。GUID形式はjunction経由で扱い、出力パスの直接指定には通常のパスを使う。集約ルート内部のjunctionは、同じルート内を指す場合も拒否されます。`mdrun` のindexは解決後の集約ルート直下に書き出されます。
+Windowsでは、仮想・マップ済みドライブを通常のドライブ文字付きパスで指定できます。集約ルートやその祖先には、Volume GUIDのボリューム直下を指すものを含め、対応するjunctionを使えます。集約ルート内部のjunctionは拒否されます。`mdrun` のindexは解決後の集約ルート直下に書き出されます。
 
-`mdreverse -OutputPath` では、明示したexportファイルの祖先にjunctionを使えます。Daily、設定ファイル、設定テンプレートへの出力、および集約領域へのexportは、junctionを経由しても拒否されます。`-Register` の設定保存ではjunctionを含むリパースポイントを拒否します。
+`mdreverse -OutputPath` では、明示したexportファイルの祖先にjunctionを使えます。Daily、QuickNotes、設定されたTODOファイル、設定ファイル、設定テンプレート、集約領域へのexportは別名パス経由でも拒否されます。`-Register` の設定保存ではjunctionを含むリパースポイントを拒否します。
 
-シンボリックリンク、ボリュームマウントポイント、その他のリパースポイント、壊れたjunction、循環参照には対応していません。失敗時は、実行直後の `$LASTEXITCODE` とPowerShellのエラーメッセージで対象パスと理由を確認してください。`mdrun` が一部失敗した場合、成功したConceptの出力は更新されることがあります。indexは保持されます。
+保存には出力ドライブがファイルの作成と置換に対応している必要があります。失敗時は、実行直後の `$LASTEXITCODE` とPowerShellのエラーメッセージで対象パスと理由を確認してください。`mdrun` が一部失敗した場合、成功したConceptの出力は更新されることがあります。indexは保持されます。複数プロセスによる同時集約や複数PCからの同時編集は保証範囲外です。
 
 生成Markdownのリンクは、解決後の出力先を基準に作られます。リンク先が異なるWindowsドライブにある場合は `file:` URIになり、開けるかどうかはMarkdownビューアに依存します。
 
@@ -218,7 +218,7 @@ mdsearch "SQLite index" -Scope All -From '2026-11-01'
 $response = mdsearch "SQLite index" -Scope All -Raw
 ```
 
-`-Scope` の既定は `Daily`。Dailyは索引上の同一検索グループ、QuickNotesは同一ファイルを単位として、空白区切りの語をANDで検索する。ASCII英字のみ大文字・小文字を同一視する。`QuickNotes` は `paths.quicknotes` 以下のMarkdown全体を読み取り専用で検索し、Daily DBの初期化や同期は不要。編集内容は次回の検索に反映する。配下のjunction、シンボリックリンク、未対応のリパースポイントは追跡せず、除外を診断に記録する。
+`-Scope` の既定は `Daily`。Dailyは索引上の同一検索グループ、QuickNotesは同一ファイルを単位として、空白区切りの語をANDで検索する。ASCII英字のみ大文字・小文字を同一視する。`QuickNotes` は仮想ドライブを含む `paths.quicknotes` 以下のMarkdownを読み取り専用で検索し、Daily DBの初期化や同期は不要。Cloud Filesで管理される項目も読み取り対象とする。編集内容は次回の検索に反映する。配下のjunction、シンボリックリンク、未対応のリパースポイントは追跡せず、除外を診断に記録する。
 
 QuickNotes内のハードリンクは、リンク数にかかわらず通常のMarkdownとして検索する。ルート外のファイル名と同じファイル実体を共有する場合も、その内容が検索対象になる。検索ルートはファイルの探索範囲を定めるもので、アクセス権限を分離するセキュリティ境界ではない。集約出力では引き続きハードリンクを拒否する。
 
