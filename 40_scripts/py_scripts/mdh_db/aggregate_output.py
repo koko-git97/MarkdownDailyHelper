@@ -186,7 +186,7 @@ def _file_revision(path):
     return (_optional_identity(info), info.st_size, info.st_mtime_ns)
 
 
-def _canonical_volume_path(path):
+def _canonical_volume_path(path, *, volume_mode=1):
     import ctypes
     from ctypes import wintypes
 
@@ -211,10 +211,10 @@ def _canonical_volume_path(path):
             raise ctypes.WinError(error)
         try:
             buffer = ctypes.create_unicode_buffer(32768)
-            # Prefer the same DOS name used for existing output and links.
-            size = final_name(handle, buffer, len(buffer), 0)
+            size = final_name(handle, buffer, len(buffer), volume_mode)
             if not size and ctypes.get_last_error() == 3:
-                size = final_name(handle, buffer, len(buffer), 1)
+                # Network shares have no GUID, and some local volumes have no DOS name.
+                size = final_name(handle, buffer, len(buffer), 1 - volume_mode)
             if not size:
                 raise ctypes.WinError(ctypes.get_last_error())
             if size >= len(buffer):
@@ -321,7 +321,13 @@ def _writer(path: Path):
             os.close(descriptor)
         return
 
-    key = sha256(str(path).upper().encode("utf-8")).hexdigest()
+    lock_path = path
+    if _volume_path(path):
+        # Keep the same mutex as writers reaching this file through a DOS path.
+        lock_path = _canonical_volume_path(path, volume_mode=0)
+        if not _volume_path(lock_path):
+            lock_path = str(lock_path)[len(_EXTENDED):]
+    key = sha256(str(lock_path).upper().encode("utf-8")).hexdigest()
     with _windows_mutex(key, path):
         yield
 

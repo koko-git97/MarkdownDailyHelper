@@ -495,12 +495,46 @@ class AggregateTests(unittest.TestCase):
                 with self.assertRaises(AggregateError):
                     _junction_destination(self.root / "link", info)
         self.assertEqual(relative_url(root / "file.md", root), "file.md")
-        self.assertTrue(relative_url(self.root / "file.md", root).startswith("file:///"))
+        self.assertEqual(relative_url(self.root / "file.md", root), "file.md")
         with self.assertRaises(AggregateError):
             relative_url(root / "file.md", self.root)
         with patch("mdh_db.aggregate_output._canonical_volume_path", side_effect=PermissionError):
             with self.assertRaises(PermissionError):
                 _resolve(root)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows paths")
+    def test_relative_url_guid_mixed_paths(self):
+        guid = Path("\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\")
+        directory = guid / "output"
+        target = Path("C:/source/資料 空白.md")
+        canonical = Path(str(guid).upper()) / "source" / target.name
+        with patch.object(output, "_canonical_volume_path", return_value=canonical):
+            self.assertEqual(relative_url(target, directory), "../source/資料%20空白.md")
+
+        cases = (Path(str(canonical).replace("01234567", "76543210")),
+                 OSError("no GUID"), AggregateError("path too long"))
+        for result in cases:
+            with self.subTest(result=result), patch.object(
+                    output, "_canonical_volume_path",
+                    **({"side_effect": result} if isinstance(result, Exception) else {"return_value": result})):
+                self.assertEqual(relative_url(target, directory), target.as_uri())
+
+        unc = Path(r"\\server\share\missing file.md")
+        with patch.object(output, "_canonical_volume_path", return_value=unc):
+            self.assertEqual(relative_url(unc, directory), unc.as_uri())
+        self.assertEqual(relative_url(target, Path("c:/output")), "../source/資料%20空白.md")
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows GUID paths")
+    def test_guid_and_dos_output_use_same_mutex(self):
+        path = self.root / "missing.md"
+        with patch.object(output, "_windows_mutex") as mutex:
+            with _writer(path):
+                pass
+            with _writer(volume_alias(self.root) / path.name):
+                pass
+        keys = [call.args[0] for call in mutex.call_args_list]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
 
     @unittest.skipUnless(os.name == "nt", "requires Windows API bindings")
     def test_canonical_volume_path_windows_api_branches(self):
@@ -510,14 +544,13 @@ class AggregateTests(unittest.TestCase):
         guid = volume_alias(self.root)
         invalid = ctypes.c_void_p(-1).value
         cases = (
-            ("DOS", [7], 0, [(4, 0, str(path))], [0], path, None),
-            ("GUID fallback", [7], 0, [(0, 3, None), (4, 0, str(guid / path.name))],
-             [0, 1], guid / path.name, None),
-            ("GUID failure", [7], 0, [(0, 3, None), (0, 3, None)], [0, 1], None, 3),
-            ("missing", [invalid, 7], 2, [(4, 0, str(self.root))], [0], path, None),
+            ("DOS fallback", [7], 0, [(0, 3, None), (4, 0, str(path))], [1, 0], path, None),
+            ("GUID", [7], 0, [(4, 0, str(guid / path.name))], [1], guid / path.name, None),
+            ("GUID failure", [7], 0, [(0, 3, None), (0, 3, None)], [1, 0], None, 3),
+            ("missing", [invalid, 7], 2, [(4, 0, str(guid))], [1], guid / path.name, None),
             ("open denied", [invalid], 5, [], [], None, 5),
-            ("query denied", [7], 0, [(0, 5, None)], [0], None, 5),
-            ("buffer full", [7], 0, [(32768, 0, None)], [0], None, "too long"),
+            ("query denied", [7], 0, [(0, 5, None)], [1], None, 5),
+            ("buffer full", [7], 0, [(32768, 0, None)], [1], None, "too long"),
         )
         for name, handles, open_error, replies, flags, expected, error in cases:
             with self.subTest(case=name):
@@ -591,7 +624,8 @@ class AggregateTests(unittest.TestCase):
         outer = self.root / "DOS link"
         self.junction(outer, guid_alias)
         self.aggregate = outer / "new" / "inner"
-        self.set_concepts({"Alpha": {"category": "Work"}})
+        self.set_concepts({"Alpha": {"category": "Work"}, "Beta": {"category": "Work"}})
+        self.write_daily("2026-11-24", "## Beta\nfixture\n")
         daily = self.write_daily("2026-11-23", "## Alpha\n[asset](asset.txt)\n")
         asset = daily.with_name("asset.txt")
         asset.write_bytes(b"asset")
@@ -602,7 +636,11 @@ class AggregateTests(unittest.TestCase):
         self.assertIn(relative_url(daily, target.parent), content)
         self.assertIn(relative_url(asset, target.parent), content)
         self.assertNotIn("file:", content)
+        code, report, _ = self.command("reverse", "--concept=Alpha")
+        self.assertEqual(code, 0)
+        self.assertFalse(report["concepts"][0]["changed"])
         self.assertEqual(self.command("run")[0], 0)
+        self.assertTrue((target.parent / "Beta.md").is_file())
         index = target.parent.parent / "index.md"
         self.assertIn("[Alpha](Work/Alpha.md)", index.read_text(encoding="utf-8"))
         self.assertEqual(self.command("reverse", "--concept=Alpha", f"--output={guid_alias / 'export.md'}")[0], 0)
@@ -656,7 +694,7 @@ class AggregateTests(unittest.TestCase):
         self.junction(settings, volume_alias(self.config.parent))
         before = daily.read_bytes(), self.config.read_bytes()
         # The real GUID path is usable. Simulate only the absence of a DOS final name.
-        with patch("mdh_db.aggregate_output._canonical_volume_path", side_effect=lambda path: path):
+        with patch("mdh_db.aggregate_output._canonical_volume_path", side_effect=lambda path, **kwargs: path):
             code, _, issues = self.command("run")
             for protected in (daily_alias / "blocked.md", settings / "config.json",
                               settings / "config.template.json", actual / "blocked.md"):

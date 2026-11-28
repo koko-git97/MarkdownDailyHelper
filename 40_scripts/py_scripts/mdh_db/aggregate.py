@@ -239,10 +239,20 @@ def grouped_entries(entries: list[Entry]) -> list[list[Entry]]:
 
 def relative_url(target: Path, directory: Path) -> str:
     if os.name == "nt" and target.drive and target.drive.lower() != directory.drive.lower():
-        # There is no relative path across Windows drives.
-        if target.drive.startswith("\\\\?\\"):
-            raise AggregateError(f"Cannot generate a file URI without a drive-letter target: {target}")
-        return target.as_uri()
+        if directory.drive.lower().startswith("\\\\?\\volume{") and not target.drive.startswith("\\\\?\\"):
+            from .aggregate_output import _canonical_volume_path
+
+            try:
+                canonical = _canonical_volume_path(target)
+            except (OSError, AggregateError):
+                pass
+            else:
+                if canonical.drive.lower() == directory.drive.lower():
+                    target = canonical
+        if target.drive.lower() != directory.drive.lower():
+            if target.drive.startswith("\\\\?\\"):
+                raise AggregateError(f"Cannot generate a file URI without a drive-letter target: {target}")
+            return target.as_uri()
     path = Path(os.path.relpath(target, directory)).as_posix()
     return "".join(char if not char.isascii() and char.isprintable() else quote(char, safe="/")
                    for char in path)
